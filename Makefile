@@ -1,35 +1,36 @@
 CC = clang
 DBG = lldb
 
+PKG_CFLAGS = $(shell pkg-config --cflags sdl3)
+PKG_LIBS = $(shell pkg-config --libs sdl3)
+
+CFLAGS = -Wall -O0 -g -Ivendor $(PKG_CFLAGS)
+LIBS = $(PKG_LIBS)
+
+SRCS = src/main.c src/renderer.c vendor/microui.c
+
 .PHONY: build-main
 build-main: build-dir
-	$(CC) -Wall -O0 -g -o build/main src/main.c
+	$(CC) $(CFLAGS) -o build/main $(SRCS) $(LIBS)
 
 .PHONY: check
 check:
-	@which $(CC) > /dev/null && echo "SUCCESS: $(CC) is installed" || echo "ERROR: $(CC) not found, please install clang"
-	@which $(DBG) > /dev/null && echo "SUCCESS: $(DBG) is installed" || echo "ERROR: $(DBG) not found, please install lldb"
+	@which $(CC) > /dev/null && echo "SUCCESS: $(CC) is installed" || echo "ERROR: $(CC) not found"
+	@which $(DBG) > /dev/null && echo "SUCCESS: $(DBG) is installed" || echo "ERROR: $(DBG) not found"
+	@pkg-config --exists sdl3 && echo "SUCCESS: sdl3 found" || echo "ERROR: sdl3 not found, run 'brew install sdl3'"
 
 .PHONY: build-dir
 build-dir:
-	if [ ! -d build ]; then mkdir build; fi
-
-.PHONY: build-test
-build-test: build-dir
-	$(CC) -Wall -O0 -g -o build/test src/test.c
+	mkdir -p build
 
 .PHONY: run
 run: build-main
 	./build/main
 
-.PHONY: test
-test: build-test
-	./build/test
-
 .PHONY: debug
 debug: build-main
 	$(DBG) ./build/main
 
-.PHONY: debug-test
-debug-test: build-test
-	$(DBG) ./build/test
+.PHONY: compiledb
+compiledb:
+	bear -- $(MAKE) build-main
