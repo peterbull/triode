@@ -7,7 +7,7 @@ PKG_LIBS = $(shell pkg-config --libs sdl3)
 CFLAGS = -Wall -O0 -g -Ivendor $(PKG_CFLAGS)
 LIBS = $(PKG_LIBS)
 
-SRCS = src/main.c src/renderer.c vendor/microui.c
+SRCS = src/main.c src/renderer.c vendor/microui.c src/audio.c
 
 .PHONY: build-main
 build-main: build-dir

@@ -6,13 +6,17 @@
 
 static SDL_Renderer *sdl_renderer;
 static SDL_Texture *font_texture;
+typedef struct my_garbage {
+  char* my_garbage1;
+  int my_garbage2;
+} my_garbage_t;
 
 static void init_atlas_texture(void) {
   SDL_Surface *surface =
       SDL_CreateSurface(ATLAS_WIDTH, ATLAS_HEIGHT, SDL_PIXELFORMAT_RGBA32);
   Uint32 *pixels = (Uint32 *)surface->pixels;
   for (int i = 0; i < ATLAS_WIDTH * ATLAS_HEIGHT; i++) {
-    Uint8 alpha = atlas_texture[i]; 
+    Uint8 alpha = atlas_texture[i];
     pixels[i] = (alpha << 24) | 0x00FFFFFF;
   }
   font_texture = SDL_CreateTextureFromSurface(sdl_renderer, surface);
@@ -21,6 +25,7 @@ static void init_atlas_texture(void) {
 }
 
 void r_init(SDL_Window *window, SDL_Renderer *renderer) {
+  my_garbage_t *garbage;
   sdl_renderer = renderer;
   (void)window;
   init_atlas_texture();
@@ -33,29 +38,30 @@ void r_draw_rect(mu_Rect rect, mu_Color color) {
 }
 
 void r_draw_text(const char *text, mu_Vec2 pos, mu_Color color) {
-    SDL_SetTextureColorMod(font_texture, color.r, color.g, color.b);
-    SDL_SetTextureAlphaMod(font_texture, color.a);
-    int x = pos.x;
-    for (const char *p = text; *p; p++) {
-        if ((*p & 0xc0) == 0x80) continue;
-        int chr = mu_min((unsigned char)*p, 127);
-        mu_Rect src = atlas[ATLAS_FONT + chr];
-        SDL_FRect srect = { (float)src.x, (float)src.y, (float)src.w, (float)src.h };
-        SDL_FRect drect = { (float)x, (float)pos.y, (float)src.w, (float)src.h };
-        SDL_RenderTexture(sdl_renderer, font_texture, &srect, &drect);
-        x += src.w;
-    }
+  SDL_SetTextureColorMod(font_texture, color.r, color.g, color.b);
+  SDL_SetTextureAlphaMod(font_texture, color.a);
+  int x = pos.x;
+  for (const char *p = text; *p; p++) {
+    if ((*p & 0xc0) == 0x80)
+      continue;
+    int chr = mu_min((unsigned char)*p, 127);
+    mu_Rect src = atlas[ATLAS_FONT + chr];
+    SDL_FRect srect = {(float)src.x, (float)src.y, (float)src.w, (float)src.h};
+    SDL_FRect drect = {(float)x, (float)pos.y, (float)src.w, (float)src.h};
+    SDL_RenderTexture(sdl_renderer, font_texture, &srect, &drect);
+    x += src.w;
+  }
 }
 
 void r_draw_icon(int id, mu_Rect rect, mu_Color color) {
-    mu_Rect src = atlas[id];
-    int x = rect.x + (rect.w - src.w) / 2;
-    int y = rect.y + (rect.h - src.h) / 2;
-    SDL_SetTextureColorMod(font_texture, color.r, color.g, color.b);
-    SDL_SetTextureAlphaMod(font_texture, color.a);
-    SDL_FRect srect = { (float)src.x, (float)src.y, (float)src.w, (float)src.h };
-    SDL_FRect drect = { (float)x, (float)y, (float)src.w, (float)src.h };
-    SDL_RenderTexture(sdl_renderer, font_texture, &srect, &drect);
+  mu_Rect src = atlas[id];
+  int x = rect.x + (rect.w - src.w) / 2;
+  int y = rect.y + (rect.h - src.h) / 2;
+  SDL_SetTextureColorMod(font_texture, color.r, color.g, color.b);
+  SDL_SetTextureAlphaMod(font_texture, color.a);
+  SDL_FRect srect = {(float)src.x, (float)src.y, (float)src.w, (float)src.h};
+  SDL_FRect drect = {(float)x, (float)y, (float)src.w, (float)src.h};
+  SDL_RenderTexture(sdl_renderer, font_texture, &srect, &drect);
 }
 
 int r_get_text_width(mu_Font font, const char *text, int len) {

@@ -2,6 +2,7 @@
 #include "renderer.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
+#include "audio.h"
 
 static const char button_map[256] = {
     [SDL_BUTTON_LEFT & 0xff] = MU_MOUSE_LEFT,
@@ -24,9 +25,14 @@ static void process_frame(mu_Context *ctx) {
   mu_end(ctx);
 }
 
-int main(void) {
+int window(void) {
   SDL_Init(SDL_INIT_VIDEO);
 
+  unsigned long long window_flags1 = SDL_WINDOW_RESIZABLE;
+  unsigned long long window_flags2 =
+      SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS;
+  unsigned long long window_flags3 = SDL_WINDOW_RESIZABLE;
+  // SDL_Window *window2 = SDL_CreateWindow("Testode", 800, 600, window_flags2);
   SDL_Window *window =
       SDL_CreateWindow("Triode", 800, 600, SDL_WINDOW_RESIZABLE);
   SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
@@ -97,3 +103,4 @@ int main(void) {
   SDL_Quit();
   return 0;
 }
+int main() { capture_audio(); }
