@@ -2,6 +2,24 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#define LOCAL_DEV_MIC "MacBook Pro Microphone"
+
+SDL_AudioDeviceID find_device_by_name(const char *target_name, bool recording) {
+  int count = 0;
+  SDL_AudioDeviceID *devices = SDL_GetAudioRecordingDevices(&count);
+  SDL_AudioDeviceID device_id = 0;
+  for (int i = 0; i < count; i++) {
+    const char *name = SDL_GetAudioDeviceName(devices[i]);
+    if (strcmp(name, target_name) == 0) {
+      printf("found device %s\n", name);
+      device_id = devices[i]; 
+      return device_id;
+    }
+  }
+  return device_id; // check for 0 in caller
+}
 
 void capture_audio() {
   SDL_AudioSpec spec;
@@ -9,12 +27,16 @@ void capture_audio() {
   spec.channels = 2;
   spec.freq = 48000;
   SDL_Init(SDL_INIT_AUDIO);
+
+  SDL_AudioDeviceID device_id = find_device_by_name(LOCAL_DEV_MIC, false);
   SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(
-      SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, NULL, NULL);
+      device_id, &spec, NULL, NULL);
+  
   if (!stream) {
     printf("error: %s\n", SDL_GetError());
     return;
   }
+
   SDL_ResumeAudioStreamDevice(stream);
 
   int bytes_per_sample = 4;
