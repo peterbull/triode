@@ -103,4 +103,7 @@ int window(void) {
   SDL_Quit();
   return 0;
 }
-int main() { capture_audio(); }
+int main() { 
+  capture_audio(); 
+  // window();
+}

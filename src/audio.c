@@ -100,7 +100,7 @@ void capture_audio() {
 
   const char *err = SDL_GetError();
   SDL_DestroyAudioStream(stream);
-  SDL_DestroyAudioStream(playback_stream);
+  // SDL_DestroyAudioStream(playback_stream);
   free(buffer);
   printf("break");
 }

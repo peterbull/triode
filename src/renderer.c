@@ -25,7 +25,6 @@ static void init_atlas_texture(void) {
 }
 
 void r_init(SDL_Window *window, SDL_Renderer *renderer) {
-  my_garbage_t *garbage;
   sdl_renderer = renderer;
   (void)window;
   init_atlas_texture();
