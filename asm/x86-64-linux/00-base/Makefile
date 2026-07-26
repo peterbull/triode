@@ -1,4 +1,5 @@
 IMAGE     := x86-64-asm
+PLATFORM  := linux/amd64
 NASM      := nasm
 LD        := ld
 TARGET    := base
@@ -12,7 +13,7 @@ BIN       := $(OUT_DIR)/base
 build: $(BIN)
 
 $(BIN): $(SRC) | $(OUT_DIR)
-	docker run --rm \
+	docker run --rm --platform=$(PLATFORM) \
 		-v "$(CURDIR):/src" \
 		$(IMAGE) \
 		"nasm -f elf64 $(SRC) -o $(OBJ) && ld $(OBJ) -o $(BIN) && echo '✓ $(TARGET) built'"
@@ -21,13 +22,13 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 run: build
-	docker run --rm \
+	docker run --rm --platform=$(PLATFORM) \
 		-v "$(CURDIR):/src" \
 		$(IMAGE) \
 		"./$(BIN)"
 
 shell:
-	docker run --rm -it \
+	docker run --rm -it --platform=$(PLATFORM) \
 		-v "$(CURDIR):/src" \
 		$(IMAGE)
 
