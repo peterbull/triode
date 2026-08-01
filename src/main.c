@@ -1,8 +1,8 @@
+#include "audio.h"
 #include "microui.h"
 #include "renderer.h"
 #include <SDL3/SDL.h>
 #include <stdlib.h>
-#include "audio.h"
 
 static const char button_map[256] = {
     [SDL_BUTTON_LEFT & 0xff] = MU_MOUSE_LEFT,
@@ -12,13 +12,16 @@ static const char button_map[256] = {
 
 static void process_frame(mu_Context *ctx) {
   mu_begin(ctx);
-  if (mu_begin_window(ctx, "Triode", mu_rect(50, 50, 300, 200))) {
+  if (mu_begin_window(ctx, "Triode", mu_rect(50, 50, 400, 200))) {
     mu_layout_row(ctx, 1, (int[]){-1}, 0);
     mu_label(ctx, "Hello, Triode!");
 
-    mu_layout_row(ctx, 1, (int[]){-1}, 0);
+    mu_layout_row(ctx, 2, (int[]){150, 200}, 0);
     if (mu_button(ctx, "Click me")) {
-      SDL_Log("Button clicked!");
+      SDL_Log("[INFO] Button clicked!");
+    }
+    if (mu_button(ctx, "Record Sample and playback")) {
+      capture_audio();
     }
     mu_end_window(ctx);
   }
@@ -28,13 +31,8 @@ static void process_frame(mu_Context *ctx) {
 int window(void) {
   SDL_Init(SDL_INIT_VIDEO);
 
-  unsigned long long window_flags1 = SDL_WINDOW_RESIZABLE;
-  unsigned long long window_flags2 =
-      SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS;
-  unsigned long long window_flags3 = SDL_WINDOW_RESIZABLE;
-  // SDL_Window *window2 = SDL_CreateWindow("Testode", 800, 600, window_flags2);
   SDL_Window *window =
-      SDL_CreateWindow("Triode", 800, 600, SDL_WINDOW_RESIZABLE);
+      SDL_CreateWindow("Triode", 1200, 800, SDL_WINDOW_RESIZABLE);
   SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
 
   r_init(window, renderer);
@@ -103,7 +101,8 @@ int window(void) {
   SDL_Quit();
   return 0;
 }
-int main() { 
-  capture_audio(); 
-  // window();
+int main() {
+  // capture_audio();
+  window();
+  exit(0);
 }

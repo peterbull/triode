@@ -5,7 +5,10 @@
 #include <string.h>
 
 #define LOCAL_DEV_MIC "MacBook Pro Microphone"
+#define LOCAL_DEV_SPEAKERS "MacBook Pro Speakers"
 #define LOCAL_DEV_HEADPHONES "Hyper Nova"
+
+
 
 SDL_AudioDeviceID find_device_by_name(const char *target_name, bool recording) {
   int count = 0;
@@ -44,9 +47,17 @@ void capture_audio() {
   spec.format = SDL_AUDIO_F32;
   spec.channels = 2;
   spec.freq = 48000;
+  const char * input_device = LOCAL_DEV_MIC; 
+  const char * playback_device = LOCAL_DEV_HEADPHONES; 
   SDL_Init(SDL_INIT_AUDIO);
 
-  SDL_AudioDeviceID record_devid = find_device_by_name(LOCAL_DEV_MIC, true);
+  SDL_AudioDeviceID record_devid = find_device_by_name(input_device, true);
+
+  if (record_devid == 0) {
+    fprintf(stderr, "could not find input device: %s\n", input_device);
+    exit(1);
+  }
+
   SDL_AudioStream *stream =
       SDL_OpenAudioDeviceStream(record_devid, &spec, NULL, NULL);
 
@@ -81,7 +92,12 @@ void capture_audio() {
   printf("break");
 
   SDL_AudioDeviceID playback_devid =
-      find_device_by_name(LOCAL_DEV_HEADPHONES, false);
+      find_device_by_name(playback_device, false);
+
+  if (playback_devid == 0) {
+    fprintf(stderr, "could not find playback device: %s\n", playback_device);
+    exit(1);
+  }
 
   SDL_AudioStream *playback_stream =
       SDL_OpenAudioDeviceStream(playback_devid, &spec, NULL, NULL);
@@ -100,7 +116,7 @@ void capture_audio() {
 
   const char *err = SDL_GetError();
   SDL_DestroyAudioStream(stream);
-  // SDL_DestroyAudioStream(playback_stream);
+  SDL_DestroyAudioStream(playback_stream);
   free(buffer);
   printf("break");
 }
