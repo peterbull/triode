@@ -10,119 +10,8 @@
 #define LOCAL_DEV_MIC "MacBook Pro Microphone"
 #define LOCAL_DEV_SPEAKERS "MacBook Pro Speakers"
 #define LOCAL_DEV_HEADPHONES "Hyper Nova"
-
-// SDL
-SDL_AudioDeviceID find_device_by_name(const char *target_name, bool recording) {
-  int count = 0;
-  SDL_AudioDeviceID *devices = recording ? SDL_GetAudioRecordingDevices(&count)
-                                         : SDL_GetAudioPlaybackDevices(&count);
-  SDL_AudioDeviceID device_id = 0;
-  for (int i = 0; i < count; i++) {
-    const char *name = SDL_GetAudioDeviceName(devices[i]);
-    printf("checking device: %s\n", name);
-    if (strcmp(name, target_name) == 0) {
-      printf("found device %s\n", name);
-      device_id = devices[i];
-    }
-  }
-  SDL_free(devices);
-  return device_id; // check for 0 in caller
-}
-
-void audio_callback(void *userdata, SDL_AudioStream *stream,
-                    int additional_amount, int total_amount) {
-  if (additional_amount > 0) {
-    Uint8 *buf = (Uint8 *)SDL_malloc(additional_amount);
-    if (buf) {
-      int total_read = SDL_GetAudioStreamData(stream, buf, additional_amount);
-      if (total_read > 0) {
-        printf("grabbed %d bytes of audio\n", total_read);
-      }
-    }
-    SDL_free(buf);
-  }
-};
-
-void capture_audio_sdl() {
-  SDL_AudioSpec spec = {0};
-  ;
-  spec.format = SDL_AUDIO_F32;
-  spec.channels = 2;
-  spec.freq = 48000;
-  const char *input_device = LOCAL_DEV_MIC;
-  const char *playback_device = LOCAL_DEV_HEADPHONES;
-  SDL_Init(SDL_INIT_AUDIO);
-
-  SDL_AudioDeviceID record_devid = find_device_by_name(input_device, true);
-
-  if (record_devid == 0) {
-    fprintf(stderr, "could not find input device: %s\n", input_device);
-    exit(1);
-  }
-
-  SDL_AudioStream *stream =
-      SDL_OpenAudioDeviceStream(record_devid, &spec, NULL, NULL);
-
-  if (!stream) {
-    printf("error: %s\n", SDL_GetError());
-    return;
-  }
-
-  SDL_ResumeAudioStreamDevice(stream);
-
-  // int bytes_per_sample = 4;
-  // int target_bytes = spec.freq * spec.channels * bytes_per_sample * 3;
-  //
-  // uint8_t *buffer = (uint8_t *)malloc(target_bytes);
-  // int total_read = 0;
-  //
-  // while (total_read < target_bytes) {
-  //   int available = SDL_GetAudioStreamAvailable(stream);
-  //   if (available > 0) {
-  //     int to_read = available;
-  //     if (total_read + to_read > target_bytes) {
-  //       to_read = target_bytes - total_read;
-  //     }
-  //     int bytes_read =
-  //         SDL_GetAudioStreamData(stream, buffer + total_read, to_read);
-  //     if (bytes_read > 0) {
-  //       total_read += bytes_read;
-  //     }
-  //   }
-  //   SDL_Delay(1);
-  // }
-  // printf("break");
-  //
-  // SDL_AudioDeviceID playback_devid =
-  //     find_device_by_name(playback_device, false);
-  //
-  // if (playback_devid == 0) {
-  //   fprintf(stderr, "could not find playback device: %s\n", playback_device);
-  //   exit(1);
-  // }
-  //
-  // SDL_AudioStream *playback_stream =
-  //     SDL_OpenAudioDeviceStream(playback_devid, &spec, NULL, NULL);
-  // if (!playback_stream) {
-  //   printf("error opening playback stream: %s\n", SDL_GetError());
-  //   free(buffer);
-  //   SDL_DestroyAudioStream(stream);
-  //   return;
-  // }
-  //
-  // SDL_PutAudioStreamData(playback_stream, buffer, total_read);
-  // SDL_ResumeAudioStreamDevice(playback_stream);
-  //
-  // while (SDL_GetAudioStreamAvailable(playback_stream) > 0) {
-  //   SDL_Delay(10);
-  // }
-
-  const char *err = SDL_GetError();
-  SDL_DestroyAudioStream(stream);
-  // SDL_DestroyAudioStream(playback_stream);
-  // free(buffer);
-  printf("break");
-}
+#define AUDIO_INTERFACE "Scarlett 2i2 4th Gen"
+#define SAMPLE_FILE "data/guitsample.mp3"
 
 ma_device_id *find_capture_device_by_name(ma_device_info *infos,
                                           ma_uint32 count,
@@ -135,7 +24,6 @@ ma_device_id *find_capture_device_by_name(ma_device_info *infos,
   return NULL;
 }
 
-
 float distort(float sample, float drive) { return tanhf(sample * drive); }
 
 void data_callback(ma_device *device, void *output, const void *input,
@@ -144,11 +32,11 @@ void data_callback(ma_device *device, void *output, const void *input,
   float *out = (float *)output;
 
   for (ma_uint32 i = 0; i < frame_count * device->capture.channels; i++) {
-    out[i] = distort(in[i], 5.0);
+    // out[i] = distort(in[i], 5.0f);
+    out[i] = i[in];
     // printf("data: [%d, %f]\n", i, in[i]);
   }
 }
-
 
 void capture_audio(void) {
   ma_device_info *playback_infos;
@@ -171,12 +59,15 @@ void capture_audio(void) {
   for (ma_uint32 i = 0; i < capture_count; i++) {
     printf("capture device %d: %s\n", i, capture_infos[i].name);
   }
+  for (ma_uint32 i = 0; i < playback_count; i++) {
+    printf("playback device %d: %s\n", i, playback_infos[i].name);
+  }
 
-  ma_device_id *capture_id =
-      find_capture_device_by_name(capture_infos, capture_count, LOCAL_DEV_MIC);
+  ma_device_id *capture_id = find_capture_device_by_name(
+      capture_infos, capture_count, AUDIO_INTERFACE);
 
   ma_device_id *playback_id = find_capture_device_by_name(
-      capture_infos, capture_count, LOCAL_DEV_SPEAKERS);
+      capture_infos, capture_count, AUDIO_INTERFACE);
 
   ma_device_config config = ma_device_config_init(ma_device_type_duplex);
   config.sampleRate = 48000;
@@ -190,6 +81,13 @@ void capture_audio(void) {
   config.playback.channels = 2;
   config.dataCallback = data_callback;
 
+  config.periodSizeInFrames =
+      128;            // smaller = lower latency, more underrun risk
+  config.periods = 2; // fewer periods = lower latency, less safety margin
+  config.performanceProfile =
+      ma_performance_profile_low_latency; // hints backend to prefer smaller
+                                          // buffers
+
   ma_device device;
   if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
     fprintf(stderr, "failed to init duplex device\n");
@@ -199,8 +97,107 @@ void capture_audio(void) {
   ma_device_start(&device);
 
   printf("pausing for input\n");
-  sleep(10);
+  sleep(100);
   ma_device_uninit(&device);
 
   ma_context_uninit(&context);
+}
+
+typedef struct {
+  float *data;
+  ma_uint64 total_frames;
+  ma_uint64 read_cursor;
+  ma_uint32 channels;
+} sample_buffer;
+
+void playback_callback(ma_device *device, void *output, const void *input,
+                       ma_uint32 frame_count) {
+  sample_buffer *sb = (sample_buffer *)device->pUserData;
+  float *out = (float *)output;
+
+  for (ma_uint32 i = 0; i < frame_count; i++) {
+    if (sb->read_cursor >= sb->total_frames) {
+      sb->read_cursor = 0; // loop
+    }
+    for (ma_uint32 c = 0; c < sb->channels; c++) {
+      float sample = sb->data[sb->read_cursor * sb->channels + c];
+      // out[i * sb->channels + c] = distort(sample, 5.0f); 
+      out[i * sb->channels + c] = sample; 
+    }
+    sb->read_cursor++;
+  }
+}
+int load_sample(const char *path, sample_buffer *sb) {
+  ma_decoder decoder;
+  ma_decoder_config decoder_config = ma_decoder_config_init(
+      ma_format_f32, 1, 48000); // force format/channels/rate; force mono for now
+
+  if (ma_decoder_init_file(path, &decoder_config, &decoder) != MA_SUCCESS) {
+    fprintf(stderr, "failed to load %s\n", path);
+    return -1;
+  }
+
+  ma_uint64 total_frames;
+  ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
+
+  sb->channels = decoder_config.channels;
+  sb->total_frames = total_frames;
+  sb->data = (float *)malloc(total_frames * sb->channels * sizeof(float));
+  sb->read_cursor = 0;
+
+  ma_uint64 frames_read;
+  ma_decoder_read_pcm_frames(&decoder, sb->data, total_frames, &frames_read);
+
+  ma_decoder_uninit(&decoder);
+
+  printf("loaded %llu frames from %s\n", (unsigned long long)frames_read, path);
+  return 0;
+}
+
+void playback_sample(const char *device_name, sample_buffer *sb) {
+  ma_context context;
+  ma_context_init(NULL, 0, NULL, &context);
+
+  ma_device_info *capture_infos;
+  ma_uint32 capture_count;
+  ma_device_info *playback_infos;
+  ma_uint32 playback_count;
+  ma_context_get_devices(&context, &playback_infos, &playback_count,
+                         &capture_infos, &capture_count);
+
+  ma_device_id *playback_id =
+      find_capture_device_by_name(playback_infos, playback_count, device_name);
+
+  sb->read_cursor = 0;
+
+  ma_device_config config = ma_device_config_init(ma_device_type_playback);
+  config.sampleRate = 48000;
+  config.playback.pDeviceID = playback_id;
+  config.playback.format = ma_format_f32;
+  config.playback.channels = sb->channels;
+  config.dataCallback = playback_callback;
+  config.pUserData = sb;
+  config.periodSizeInFrames = 128;
+
+  ma_device device;
+  ma_device_init(&context, &config, &device);
+  ma_device_start(&device);
+
+  printf("playing back...\n");
+  sleep(8);
+
+  ma_device_uninit(&device);
+  ma_context_uninit(&context);
+}
+
+int play_sample(void) {
+  sample_buffer sb = {0};
+
+  if (load_sample(SAMPLE_FILE, &sb) != 0) {
+    return 1;
+  }
+
+  playback_sample(AUDIO_INTERFACE, &sb);
+  free(sb.data);
+  return 0;
 }

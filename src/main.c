@@ -103,6 +103,7 @@ int window(void) {
 }
 int main() {
   // window();
-  capture_audio();
+  // capture_audio();
+  play_sample();
   exit(0);
 }
