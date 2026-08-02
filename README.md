@@ -21,3 +21,24 @@ make debug
 
 # To start `src/test.c` in the debugger
 make debug-test
+```
+
+## local sdl3 for debug:
+
+get it:
+```bash
+git clone https://github.com/libsdl-org/SDL.git ~/sdl3-src
+cd ~/sdl3-src
+git checkout release-3.4.10   
+```
+
+built it:
+```bash
+mkdir build-debug && cd build-debug
+cmake .. -DCMAKE_BUILD_TYPE=Debug \
+         -DSDL_SHARED=ON \
+         -DSDL_STATIC=ON \
+         -DCMAKE_INSTALL_PREFIX=$HOME/sdl3-debug
+cmake --build . -j$(sysctl -n hw.ncpu)
+cmake --install .
+```

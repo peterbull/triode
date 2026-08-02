@@ -102,7 +102,7 @@ int window(void) {
   return 0;
 }
 int main() {
-  // capture_audio();
-  window();
+  // window();
+  capture_audio();
   exit(0);
 }
