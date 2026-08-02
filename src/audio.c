@@ -1,14 +1,15 @@
+#include "math.h"
+#include "miniaudio.h"
 #include <SDL3/SDL.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "miniaudio.h"
+
 #define LOCAL_DEV_MIC "MacBook Pro Microphone"
 #define LOCAL_DEV_SPEAKERS "MacBook Pro Speakers"
 #define LOCAL_DEV_HEADPHONES "Hyper Nova"
-
 
 // SDL
 SDL_AudioDeviceID find_device_by_name(const char *target_name, bool recording) {
@@ -48,8 +49,8 @@ void capture_audio_sdl() {
   spec.format = SDL_AUDIO_F32;
   spec.channels = 2;
   spec.freq = 48000;
-  const char * input_device = LOCAL_DEV_MIC; 
-  const char * playback_device = LOCAL_DEV_HEADPHONES; 
+  const char *input_device = LOCAL_DEV_MIC;
+  const char *playback_device = LOCAL_DEV_HEADPHONES;
   SDL_Init(SDL_INIT_AUDIO);
 
   SDL_AudioDeviceID record_devid = find_device_by_name(input_device, true);
@@ -123,25 +124,70 @@ void capture_audio_sdl() {
   printf("break");
 }
 
+ma_device_id *find_capture_device_by_name(ma_device_info *infos,
+                                          ma_uint32 count,
+                                          const char *target_name) {
+  for (ma_uint32 i = 0; i < count; i++) {
+    if (strcmp(infos[i].name, target_name) == 0) {
+      return &infos[i].id;
+    }
+  }
+  return NULL;
+}
 
-void data_callback(ma_device *device, void *output, const void *input, ma_uint32 frame_count) {
-  // input and output buffers, both available in one callback (duplex!)
+
+float distort(float sample, float drive) { return tanhf(sample * drive); }
+
+void data_callback(ma_device *device, void *output, const void *input,
+                   ma_uint32 frame_count) {
   const float *in = (const float *)input;
   float *out = (float *)output;
 
   for (ma_uint32 i = 0; i < frame_count * device->capture.channels; i++) {
-    // out[i] = process_sample(in[i]); 
-    printf("data: %d\n", i);
+    out[i] = distort(in[i], 5.0);
+    // printf("data: [%d, %f]\n", i, in[i]);
   }
 }
 
+
 void capture_audio(void) {
+  ma_device_info *playback_infos;
+  ma_uint32 playback_count;
+  ma_device_info *capture_infos;
+  ma_uint32 capture_count = 0;
+  ma_context context;
+
+  if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
+    fprintf(stderr, "failed to init context\n");
+    return;
+  }
+
+  if (ma_context_get_devices(&context, &playback_infos, &playback_count,
+                             &capture_infos, &capture_count) != MA_SUCCESS) {
+    fprintf(stderr, "failed to enumerate devices\n");
+    return;
+  }
+
+  for (ma_uint32 i = 0; i < capture_count; i++) {
+    printf("capture device %d: %s\n", i, capture_infos[i].name);
+  }
+
+  ma_device_id *capture_id =
+      find_capture_device_by_name(capture_infos, capture_count, LOCAL_DEV_MIC);
+
+  ma_device_id *playback_id = find_capture_device_by_name(
+      capture_infos, capture_count, LOCAL_DEV_SPEAKERS);
+
   ma_device_config config = ma_device_config_init(ma_device_type_duplex);
   config.sampleRate = 48000;
+
+  config.capture.pDeviceID = capture_id;
   config.capture.format = ma_format_f32;
-  config.capture.channels = 1;
+  config.capture.channels = 2;
+
+  config.playback.pDeviceID = playback_id;
   config.playback.format = ma_format_f32;
-  config.playback.channels = 1;
+  config.playback.channels = 2;
   config.dataCallback = data_callback;
 
   ma_device device;
@@ -151,7 +197,10 @@ void capture_audio(void) {
   }
 
   ma_device_start(&device);
-  sleep(2);
+
+  printf("pausing for input\n");
+  sleep(10);
   ma_device_uninit(&device);
 
+  ma_context_uninit(&context);
 }
