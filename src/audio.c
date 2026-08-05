@@ -13,6 +13,7 @@
 #define AUDIO_INTERFACE "Scarlett 2i2 4th Gen"
 #define SAMPLE_FILE "data/guitsample.mp3"
 
+const bool NO_INTERFACE = true;
 ma_device_id *find_capture_device_by_name(ma_device_info *infos,
                                           ma_uint32 count,
                                           const char *target_name) {
@@ -24,6 +25,8 @@ ma_device_id *find_capture_device_by_name(ma_device_info *infos,
   return NULL;
 }
 
+typedef enum { EFFECT_NONE, EFFECT_DISTORTION, EFFECT_COUNT } effect_type;
+
 float distort(float sample, float drive) { return tanhf(sample * drive); }
 
 void data_callback(ma_device *device, void *output, const void *input,
@@ -32,7 +35,8 @@ void data_callback(ma_device *device, void *output, const void *input,
   float *out = (float *)output;
 
   for (ma_uint32 i = 0; i < frame_count * device->capture.channels; i++) {
-    // out[i] = distort(in[i], 5.0f);
+    // TODO: fix feedback on live monitors
+    // out[i] = distort(in[i], 2.0f);
     out[i] = i[in];
     // printf("data: [%d, %f]\n", i, in[i]);
   }
@@ -64,10 +68,12 @@ void capture_audio(void) {
   }
 
   ma_device_id *capture_id = find_capture_device_by_name(
-      capture_infos, capture_count, AUDIO_INTERFACE);
+      capture_infos, capture_count,
+      NO_INTERFACE ? LOCAL_DEV_MIC : AUDIO_INTERFACE);
 
   ma_device_id *playback_id = find_capture_device_by_name(
-      capture_infos, capture_count, AUDIO_INTERFACE);
+      capture_infos, capture_count,
+      NO_INTERFACE ? LOCAL_DEV_HEADPHONES : AUDIO_INTERFACE);
 
   ma_device_config config = ma_device_config_init(ma_device_type_duplex);
   config.sampleRate = 48000;
@@ -110,27 +116,53 @@ typedef struct {
   ma_uint32 channels;
 } sample_buffer;
 
+typedef struct {
+  effect_type type;
+  union {
+    struct {
+      float drive;
+    } distortion;
+  } params;
+} effect_state;
+
+typedef struct {
+  sample_buffer sb;
+  effect_state fx;
+} playback_ctx;
+
+static float apply_effect(effect_state *fx, float sample) {
+  switch (fx->type) {
+  case EFFECT_DISTORTION:
+    return distort(sample, fx->params.distortion.drive);
+  default:
+    return sample;
+  }
+}
+
 void playback_callback(ma_device *device, void *output, const void *input,
                        ma_uint32 frame_count) {
-  sample_buffer *sb = (sample_buffer *)device->pUserData;
+  playback_ctx *ctx = (playback_ctx *)device->pUserData;
+  sample_buffer *sb = &ctx->sb;
   float *out = (float *)output;
-
+  
   for (ma_uint32 i = 0; i < frame_count; i++) {
     if (sb->read_cursor >= sb->total_frames) {
       sb->read_cursor = 0; // loop
     }
     for (ma_uint32 c = 0; c < sb->channels; c++) {
       float sample = sb->data[sb->read_cursor * sb->channels + c];
-      // out[i * sb->channels + c] = distort(sample, 5.0f); 
-      out[i * sb->channels + c] = sample; 
+      float processed = apply_effect(&ctx->fx, sample);
+      out[i * sb->channels + c] = processed;
     }
     sb->read_cursor++;
   }
 }
+
 int load_sample(const char *path, sample_buffer *sb) {
   ma_decoder decoder;
   ma_decoder_config decoder_config = ma_decoder_config_init(
-      ma_format_f32, 1, 48000); // force format/channels/rate; force mono for now
+      ma_format_f32, 1,
+      48000); // force format/channels/rate; force mono for now
 
   if (ma_decoder_init_file(path, &decoder_config, &decoder) != MA_SUCCESS) {
     fprintf(stderr, "failed to load %s\n", path);
@@ -154,7 +186,7 @@ int load_sample(const char *path, sample_buffer *sb) {
   return 0;
 }
 
-void playback_sample(const char *device_name, sample_buffer *sb) {
+void playback_sample(const char *device_name, playback_ctx *ctx) {
   ma_context context;
   ma_context_init(NULL, 0, NULL, &context);
 
@@ -168,15 +200,15 @@ void playback_sample(const char *device_name, sample_buffer *sb) {
   ma_device_id *playback_id =
       find_capture_device_by_name(playback_infos, playback_count, device_name);
 
-  sb->read_cursor = 0;
+  ctx->sb.read_cursor = 0;
 
   ma_device_config config = ma_device_config_init(ma_device_type_playback);
   config.sampleRate = 48000;
   config.playback.pDeviceID = playback_id;
   config.playback.format = ma_format_f32;
-  config.playback.channels = sb->channels;
+  config.playback.channels = ctx->sb.channels;
   config.dataCallback = playback_callback;
-  config.pUserData = sb;
+  config.pUserData = ctx;
   config.periodSizeInFrames = 128;
 
   ma_device device;
@@ -191,13 +223,14 @@ void playback_sample(const char *device_name, sample_buffer *sb) {
 }
 
 int play_sample(void) {
-  sample_buffer sb = {0};
+  playback_ctx ctx = {.sb = {0}, .fx = {0}};
+  ctx.fx = (effect_state) { .type = EFFECT_DISTORTION, .params.distortion.drive = 10.0f};
 
-  if (load_sample(SAMPLE_FILE, &sb) != 0) {
+  if (load_sample(SAMPLE_FILE, &ctx.sb) != 0) {
     return 1;
   }
 
-  playback_sample(AUDIO_INTERFACE, &sb);
-  free(sb.data);
+  playback_sample(NO_INTERFACE ? LOCAL_DEV_HEADPHONES : AUDIO_INTERFACE, &ctx);
+  free(ctx.sb.data);
   return 0;
 }
