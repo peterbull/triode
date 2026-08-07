@@ -14,6 +14,7 @@
 #define SAMPLE_FILE "data/guitsample.mp3"
 
 const bool NO_INTERFACE = true;
+
 ma_device_id *find_capture_device_by_name(ma_device_info *infos,
                                           ma_uint32 count,
                                           const char *target_name) {
@@ -25,10 +26,14 @@ ma_device_id *find_capture_device_by_name(ma_device_info *infos,
   return NULL;
 }
 
-typedef enum { EFFECT_NONE, EFFECT_DISTORTION, EFFECT_COUNT } effect_type;
+typedef enum {
+  FX_NONE = 0,
+  FX_DISTORTION = 1 << 0, //  0001
+  FX_RECTIFIED = 1 << 2   //  0010
+} effect_flags;
 
 float distort(float sample, float drive) { return tanhf(sample * drive); }
-
+float rectify(float sample) { return fabsf(sample); }
 void data_callback(ma_device *device, void *output, const void *input,
                    ma_uint32 frame_count) {
   const float *in = (const float *)input;
@@ -42,7 +47,7 @@ void data_callback(ma_device *device, void *output, const void *input,
   }
 }
 
-void capture_audio(void) {
+void capture_audio() {
   ma_device_info *playback_infos;
   ma_uint32 playback_count;
   ma_device_info *capture_infos;
@@ -89,7 +94,7 @@ void capture_audio(void) {
 
   config.periodSizeInFrames =
       128;            // smaller = lower latency, more underrun risk
-  config.periods = 2; // fewer periods = lower latency, less safety margin
+  config.periods = 2; // fewer eriods = lower latency, less safety margin
   config.performanceProfile =
       ma_performance_profile_low_latency; // hints backend to prefer smaller
                                           // buffers
@@ -117,7 +122,7 @@ typedef struct {
 } sample_buffer;
 
 typedef struct {
-  effect_type type;
+  effect_flags effect_flags;
   union {
     struct {
       float drive;
@@ -131,20 +136,25 @@ typedef struct {
 } playback_ctx;
 
 static float apply_effect(effect_state *fx, float sample) {
-  switch (fx->type) {
-  case EFFECT_DISTORTION:
-    return distort(sample, fx->params.distortion.drive);
-  default:
-    return sample;
+  float processed = sample;
+  if (fx->effect_flags & FX_DISTORTION) {
+    processed = distort(sample, fx->params.distortion.drive);
   }
+  if (fx->effect_flags & FX_RECTIFIED) {
+    processed = rectify(processed);
+  }
+  return processed;
 }
 
+int count = 0;
+int subcount = 0;
 void playback_callback(ma_device *device, void *output, const void *input,
                        ma_uint32 frame_count) {
   playback_ctx *ctx = (playback_ctx *)device->pUserData;
   sample_buffer *sb = &ctx->sb;
   float *out = (float *)output;
-  
+  count += 1;
+  printf("count %d\n", count);
   for (ma_uint32 i = 0; i < frame_count; i++) {
     if (sb->read_cursor >= sb->total_frames) {
       sb->read_cursor = 0; // loop
@@ -153,6 +163,8 @@ void playback_callback(ma_device *device, void *output, const void *input,
       float sample = sb->data[sb->read_cursor * sb->channels + c];
       float processed = apply_effect(&ctx->fx, sample);
       out[i * sb->channels + c] = processed;
+      subcount += 1;
+      printf("subcount: %d\n", subcount);
     }
     sb->read_cursor++;
   }
@@ -224,13 +236,14 @@ void playback_sample(const char *device_name, playback_ctx *ctx) {
 
 int play_sample(void) {
   playback_ctx ctx = {.sb = {0}, .fx = {0}};
-  ctx.fx = (effect_state) { .type = EFFECT_DISTORTION, .params.distortion.drive = 10.0f};
+  ctx.fx =
+      (effect_state){.effect_flags = FX_DISTORTION | FX_RECTIFIED, .params.distortion.drive = 90.0f};
 
   if (load_sample(SAMPLE_FILE, &ctx.sb) != 0) {
     return 1;
   }
 
-  playback_sample(NO_INTERFACE ? LOCAL_DEV_HEADPHONES : AUDIO_INTERFACE, &ctx);
+  playback_sample(NO_INTERFACE ? LOCAL_DEV_SPEAKERS : AUDIO_INTERFACE, &ctx);
   free(ctx.sb.data);
   return 0;
 }
