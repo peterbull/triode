@@ -1,0 +1,1291 @@
+//! The engine: rack of slots, the command mailbox, and the shared state between the
+//! UI thread and the audio thread.
+//!
+//! ## Why the mailbox looks over-built
+//!
+//! The UI thread only ever *pushes* [`Cmd`]s; the audio callback drains them with
+//! `try_lock`. If the lock is momentarily held the audio thread processes the previous
+//! block again rather than waiting — a busy mailbox costs one block of latency, never a
+//! dropout and never a priority inversion.
+//!
+//! ## Why parameters and structure are separate
+//!
+//! A knob move sends [`Cmd::SetParam`], which touches three floats. It never rebuilds a
+//! slot, so delay lines, reverb tails and envelope state survive every edit. Only
+//! [`Cmd::InsertSlot`]/[`Cmd::RemoveSlot`]/[`Cmd::MoveSlot`] change the `Vec<Slot>`, and
+//! they *move* the existing `Box<dyn Proc>` instead of recreating it, so reordering the
+//! rack keeps each pedal's internal state.
+//!
+//! ## Why insertion carries a built slot
+//!
+//! `Box<dyn Proc>` (a reverb's comb buffers are a few hundred KB) is allocated on the UI
+//! thread and moved into the queue. The audio thread never allocates.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Instant;
+
+use crate::dsp::amp::Amp;
+use crate::dsp::biquad::{Biquad, Coef, DcBlocker};
+use crate::dsp::cab::{Cab, Ir};
+use crate::dsp::limiter::Limiter;
+use crate::dsp::meter::Meter;
+use crate::dsp::resampler::{Resampler, Source};
+use crate::dsp::{db2lin, sanitize, Frame, MAX_CHUNK};
+use crate::params::{amp_ix, EffectKind, ParamVals, AMP_SPECS, MAX_SLOTS};
+
+/// A processing element. Implementations must not allocate, lock or block inside
+/// `process`; construction and `set_rates` may allocate.
+pub trait Proc: Send {
+    /// Recompute sample-rate-dependent state (coefficient caches, delay lengths).
+    fn set_rates(&mut self, _sr: f32) {}
+    /// Process `n` frames of `buf` in place. `p.v[i]` are real (denormalised) values.
+    fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals);
+    /// Clear internal state.
+    fn reset(&mut self) {}
+}
+
+/// One rack position: a kind, its bypass state, its params, and its live state.
+pub struct Slot {
+    pub kind: EffectKind,
+    pub enabled: bool,
+    /// Target normalised values, as set by the UI.
+    pub target: ParamVals,
+    /// Smoothed normalised values, advanced toward `target` once per chunk.
+    pub smooth: ParamVals,
+    /// Real (denormalised) values handed to `Proc::process`, recomputed per chunk.
+    pub values: ParamVals,
+    pub proc: Box<dyn Proc>,
+}
+
+impl Slot {
+    pub fn new(kind: EffectKind, enabled: bool) -> Slot {
+        let norms = kind.default_norms();
+        Slot {
+            kind,
+            enabled,
+            target: norms,
+            smooth: norms,
+            values: norms,
+            proc: make_proc(kind),
+        }
+    }
+
+    /// Build a slot on a non-audio thread, ready to be moved into the mailbox.
+    pub fn build(kind: EffectKind, enabled: bool, sr: f32) -> Slot {
+        let mut s = Slot::new(kind, enabled);
+        s.proc.set_rates(sr);
+        s
+    }
+
+    /// Advance smoothed params toward the targets and denormalise them.
+    ///
+    /// Smoothing at chunk rate (rather than per sample) is the deliberate trade: a knob
+    /// sweep steps at roughly 90 Hz with a ~15 ms time constant, which is inaudible, and
+    /// it keeps filter coefficients constant inside a chunk so a biquad never sees a
+    /// coefficient discontinuity mid-block.
+    ///
+    /// `ponytail:` if a fast-swept resonant filter ever clicks, upgrade this to
+    /// per-sample coefficient interpolation inside the affected effect only.
+    #[inline]
+    pub(crate) fn advance(&mut self, k: f32) {
+        let specs = self.kind.params();
+        for (i, spec) in specs.iter().enumerate() {
+            let t = self.target.get(spec, i);
+            let cur = self.smooth.v[i].clamp(0.0, 1.0);
+            self.smooth.v[i] = cur + (t - cur) * k;
+            self.values.v[i] = spec.denorm(self.smooth.v[i]);
+        }
+    }
+}
+
+/// Build the processor for a kind. Called on the UI thread when a slot is created, and
+/// on the audio thread only to re-tune an already-allocated one.
+pub fn make_proc(kind: EffectKind) -> Box<dyn Proc> {
+    use crate::dsp::fx;
+    match kind {
+        EffectKind::Gate => Box::new(fx::gate::Gate::new()),
+        EffectKind::Compressor => Box::new(fx::comp::Compressor::new()),
+        EffectKind::Boost => Box::new(fx::boost::Boost::new()),
+        EffectKind::Overdrive => Box::new(fx::drive::Overdrive::new()),
+        EffectKind::Fuzz => Box::new(fx::drive::Fuzz::new()),
+        EffectKind::Tremolo => Box::new(fx::trem::Tremolo::new()),
+        EffectKind::Chorus => Box::new(fx::chorus::Chorus::new()),
+        EffectKind::Delay => Box::new(fx::delay::StereoDelay::new()),
+        EffectKind::Reverb => Box::new(fx::reverb::Reverb::new()),
+    }
+}
+
+/// Which non-rack switch a [`Cmd::Flag`] refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flag {
+    Cab,
+    InputHpf,
+    Muted,
+}
+
+/// A request to rebuild the audio streams (device or buffer-size change).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReopenReq {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub buffer_ms: u32,
+    /// Open the input stream at all. `false` means output-only: the amp is live and the
+    /// test tone still drives the wave view, but nothing is captured -- which is the only
+    /// reliable way to avoid a howl on the very common laptop-speakers-plus-laptop-mic
+    /// desk. The UI arms it with one click.
+    pub input_on: bool,
+}
+
+/// One UI-initiated change. Non-allocating except for a pre-built slot or an IR.
+pub enum Cmd {
+    SetParam {
+        slot: usize,
+        idx: usize,
+        norm: f32,
+    },
+    SetEnabled {
+        slot: usize,
+        on: bool,
+    },
+    /// Insert a slot built on the UI thread at index `at` (clamped).
+    InsertSlot {
+        at: usize,
+        slot: Box<Slot>,
+    },
+    RemoveSlot {
+        slot: usize,
+    },
+    MoveSlot {
+        from: usize,
+        to: usize,
+    },
+    /// Replace the kind at `slot`, keeping its position. State is intentionally new.
+    ReplaceSlot {
+        slot: usize,
+        with: Box<Slot>,
+    },
+    AmpParam {
+        idx: usize,
+        norm: f32,
+    },
+    Flag(Flag, bool),
+    LoadIr(Box<Ir>),
+    ClearIr,
+    /// Replace the whole rack at once (preset load). Built on the UI thread for the same
+    /// reason as [`Cmd::InsertSlot`], and truncated to [`MAX_SLOTS`] on the way in.
+    LoadRack(Vec<Slot>),
+}
+
+fn put(a: &AtomicU32, v: f32) {
+    a.store(v.to_bits(), Ordering::Relaxed);
+}
+fn get(a: &AtomicU32) -> f32 {
+    f32::from_bits(a.load(Ordering::Relaxed))
+}
+
+/// Lock-free read-only statistics, published by the audio thread for the UI.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub in_peak: AtomicU32,
+    pub in_rms: AtomicU32,
+    pub out_peak: AtomicU32,
+    pub out_rms: AtomicU32,
+    pub gr_db: AtomicU32,
+    pub cpu_pct: AtomicU32,
+    /// Engine sample rate as an integer Hz.
+    pub rate: AtomicU32,
+    /// Measured input/output step ratio (1.0 when the clocks agree).
+    pub ratio: AtomicU32,
+    pub buffer_frames: AtomicU32,
+    pub ring_frames: AtomicU32,
+    pub clip_in: AtomicU64,
+    pub clip_out: AtomicU64,
+    pub underruns: AtomicU64,
+    pub overruns: AtomicU64,
+    pub dropped_in: AtomicU64,
+}
+
+/// Plain-data view of [`Stats`] for the UI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StatsSnap {
+    pub in_peak: f32,
+    pub in_rms: f32,
+    pub out_peak: f32,
+    pub out_rms: f32,
+    pub gr_db: f32,
+    pub cpu_pct: f32,
+    pub rate: u32,
+    pub ratio: f32,
+    pub buffer_frames: u32,
+    pub ring_frames: u32,
+    pub clip_in: u64,
+    pub clip_out: u64,
+    pub underruns: u64,
+    pub overruns: u64,
+    pub dropped_in: u64,
+}
+
+impl Stats {
+    pub fn snapshot(&self) -> StatsSnap {
+        StatsSnap {
+            in_peak: get(&self.in_peak),
+            in_rms: get(&self.in_rms),
+            out_peak: get(&self.out_peak),
+            out_rms: get(&self.out_rms),
+            gr_db: get(&self.gr_db),
+            cpu_pct: get(&self.cpu_pct),
+            rate: self.rate.load(Ordering::Relaxed),
+            ratio: get(&self.ratio),
+            buffer_frames: self.buffer_frames.load(Ordering::Relaxed),
+            ring_frames: self.ring_frames.load(Ordering::Relaxed),
+            clip_in: self.clip_in.load(Ordering::Relaxed),
+            clip_out: self.clip_out.load(Ordering::Relaxed),
+            underruns: self.underruns.load(Ordering::Relaxed),
+            overruns: self.overruns.load(Ordering::Relaxed),
+            dropped_in: self.dropped_in.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset_clips(&self) {
+        self.clip_in.store(0, Ordering::Relaxed);
+        self.clip_out.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How many frames the scope keeps, per channel. About 45 ms at 48 kHz, which is long
+/// enough to see a few cycles of a low E and short enough to draw every frame.
+pub const SCOPE_FRAMES: usize = 2048;
+
+/// Rolling window of the signal, for the UI's scope and transfer plot.
+///
+/// Deliberately plain `VecDeque`s behind one mutex rather than a lock-free ring: the
+/// audio thread fills it with `try_lock` and simply skips a block when the UI is reading,
+/// so a stalled UI costs a dropped waveform frame, never a glitched audio callback.
+#[derive(Debug, Default)]
+pub struct Scope {
+    pub din: VecDeque<f32>,
+    pub dout: VecDeque<f32>,
+    /// Sample rate the window was captured at, so the UI can label the time axis.
+    pub sr: f32,
+    /// Bumped on every block published, so the UI can tell a live trace from a frozen one.
+    pub seq: u64,
+}
+
+/// State shared between the UI, the audio-thread owner, and both cpal callbacks.
+#[derive(Default)]
+pub struct Shared {
+    pub cmds: Mutex<VecDeque<Cmd>>,
+    pub stats: Stats,
+    /// Set by the audio-thread owner once streams are live.
+    pub ready: AtomicBool,
+    pub quit: AtomicBool,
+    /// Pending reopen request, consumed by the thread that owns the `Stream`s.
+    pub reopen: Mutex<Option<ReopenReq>>,
+    /// Last error or note worth showing in the UI (written rarely).
+    pub status: Mutex<String>,
+    /// Waveform window, written by the audio thread, read by the UI.
+    pub scope: Mutex<Scope>,
+    /// Cleared when the UI is hidden or the user hits freeze; the engine then skips the
+    /// capture entirely rather than copying samples nobody looks at.
+    pub scope_on: AtomicBool,
+    /// Built-in test tone in Hz, `0` = off. Lives here so the UI can set it without
+    /// reaching into the audio thread; `audio_io` mixes it into the engine's input.
+    pub tone_hz: AtomicU32,
+}
+
+impl Shared {
+    pub fn new() -> Arc<Shared> {
+        Arc::new(Shared {
+            status: Mutex::new(String::new()),
+            scope_on: AtomicBool::new(true),
+            ..Default::default()
+        })
+    }
+
+    pub fn set_scope(&self, on: bool) {
+        // Not a Cmd: this only turns observation on or off, and the audio thread reads it
+        // atomically, so routing it through the mailbox would add a block of latency to a
+        // control that has no effect on the sound.
+        self.scope_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Test-tone frequency in Hz; `0` turns it off.
+    pub fn set_tone(&self, hz: f32) {
+        self.tone_hz.store(hz.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn tone(&self) -> f32 {
+        f32::from_bits(self.tone_hz.load(Ordering::Relaxed))
+    }
+
+    /// A copy of the waveform window, or `None` when the audio thread is mid-write.
+    /// Never blocks, which is the whole point of the `try_lock`.
+    pub fn scope_snap(&self) -> Option<(Vec<f32>, Vec<f32>, f32, u64)> {
+        let sc = self.scope.try_lock().ok()?;
+        Some((
+            sc.din.iter().copied().collect(),
+            sc.dout.iter().copied().collect(),
+            sc.sr,
+            sc.seq,
+        ))
+    }
+
+    pub fn send(&self, cmd: Cmd) {
+        // Lock only long enough to push a small enum; never while building anything.
+        // A poisoned `Mutex<VecDeque>` is still sound to use: the guard's panic left the
+        // queue intact, not structurally broken. Clearing it here would silently discard
+        // every queued knob move, so take the inner queue and keep pushing.
+        match self.cmds.lock() {
+            Ok(mut q) => q.push_back(cmd),
+            Err(e) => e.into_inner().push_back(cmd),
+        }
+    }
+
+    pub fn set_status(&self, msg: impl AsRef<str>) {
+        // One lock, poison-tolerant. The previous shape took the lock in the `if let` and
+        // then locked the *same* mutex again in its `else` arm (the guard lives for the
+        // whole if/else), so the poisoned-lock recovery path deadlocked instead of
+        // recovering -- i.e. a panicking UI task would hang the app on the next status
+        // write, which is exactly the moment the UI wants to report the failure.
+        let mut s = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        *s = msg.as_ref().to_string();
+    }
+
+    pub fn status(&self) -> String {
+        match self.status.lock() {
+            Ok(s) => s.clone(),
+            Err(e) => e.into_inner().clone(),
+        }
+    }
+}
+
+/// Ceiling the safety limiter works against, leaving room for a few samples of attack
+/// overshoot below full scale.
+pub const CEILING: f32 = 0.95;
+
+/// Hard bound on what ever leaves the engine. `CEILING` is a target the limiter's finite
+/// attack overshoots; this is the number that is actually true of every output sample.
+pub const FULL_SCALE: f32 = 1.0;
+
+/// The live signal chain. Owned by the output callback; `process` is the only entry.
+pub struct Engine {
+    pub slots: Vec<Slot>,
+    pub amp: Amp,
+    pub cab: Cab,
+    limiter: Limiter,
+    out_dc: DcBlocker,
+    in_dc: DcBlocker,
+    in_hpf: Biquad,
+    amp_target: ParamVals,
+    amp_smooth: ParamVals,
+    amp_values: ParamVals,
+    cab_on: bool,
+    hpf_on: bool,
+    muted: bool,
+    scratch: [[f32; 2]; MAX_CHUNK],
+    /// Mono summaries of the block currently in flight, captured either side of the
+    /// rack so the UI can plot input against output (which is what shows clipping).
+    cap_in: [f32; MAX_CHUNK],
+    cap_out: [f32; MAX_CHUNK],
+    cap_n: usize,
+    resampler: Resampler,
+    step_base: f32,
+    step: f32,
+    meter_in: Meter,
+    meter_out: Meter,
+    sr: f32,
+    in_sr: f32,
+    chunk: usize,
+    overruns: u64,
+    /// Input frames seen *consecutively* with nothing in the ring (dead mic / no
+    /// permission). Resets the moment input returns, so the UI's warning describes now
+    /// rather than the whole session.
+    silent_run: u64,
+    /// Longest such gap since start-up; what offline reports measure.
+    silent_max: u64,
+    /// Per-stage recording, off unless a trace asked for it. See [`crate::taps`].
+    taps: Option<crate::taps::TapLog>,
+}
+
+impl Engine {
+    pub fn new(sr: f32, chunk: usize) -> Engine {
+        let defaults: [f32; 7] = std::array::from_fn(|i| AMP_SPECS[i].default_norm());
+        let norms = ParamVals::from_norms(&defaults);
+        let mut e = Engine {
+            slots: Vec::new(),
+            amp: Amp::new(sr),
+            cab: Cab::new(sr),
+            limiter: Limiter::new(),
+            out_dc: DcBlocker::new(),
+            in_dc: DcBlocker::new(),
+            in_hpf: Biquad::new(Coef::highpass(75.0, 0.707, sr)),
+            amp_target: norms,
+            amp_smooth: norms,
+            amp_values: ParamVals::ZEROED,
+            cab_on: true,
+            hpf_on: true,
+            muted: false,
+            scratch: [[0.0; 2]; MAX_CHUNK],
+            cap_in: [0.0; MAX_CHUNK],
+            cap_out: [0.0; MAX_CHUNK],
+            cap_n: 0,
+            resampler: Resampler::new(),
+            step_base: 1.0,
+            step: 1.0,
+            meter_in: Meter::new(),
+            meter_out: Meter::new(),
+            sr,
+            in_sr: sr,
+            chunk: chunk.clamp(16, MAX_CHUNK),
+            overruns: 0,
+            silent_run: 0,
+            silent_max: 0,
+            taps: None,
+        };
+        // Reserved up front so Vec<Slot> never reallocates on the audio thread.
+        e.slots.reserve(MAX_SLOTS);
+        e.set_rates(sr, sr);
+        for (i, spec) in AMP_SPECS.iter().enumerate() {
+            e.amp_values.v[i] = spec.denorm(norms.v[i]);
+        }
+        e
+    }
+
+    /// The engine runs at the *output* device's rate; input is resampled to it.
+    pub fn set_rates(&mut self, in_rate: f32, out_rate: f32) {
+        self.sr = out_rate.max(1.0);
+        self.in_sr = in_rate.max(1.0);
+        self.step_base = self.in_sr / self.sr;
+        self.step = self.step_base;
+        self.resampler.set_step(self.step);
+        self.amp.set_rates(self.sr);
+        self.cab.set_rates(self.sr);
+        self.limiter.set_rates(self.sr);
+        self.out_dc.set_hz(20.0, self.sr);
+        self.in_dc.set_hz(15.0, self.sr);
+        self.in_hpf.set(Coef::highpass(75.0, 0.707, self.sr));
+        for s in self.slots.iter_mut() {
+            s.proc.set_rates(self.sr);
+        }
+    }
+
+    pub fn sr(&self) -> f32 {
+        self.sr
+    }
+
+    pub fn in_sr(&self) -> f32 {
+        self.in_sr
+    }
+
+    pub fn set_chunk(&mut self, chunk: usize) {
+        self.chunk = chunk.clamp(16, MAX_CHUNK);
+    }
+
+    pub fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    pub fn slots(&self) -> &[Slot] {
+        &self.slots
+    }
+
+    /// How many slots are currently audible.
+    pub fn active_slots(&self) -> usize {
+        self.slots.iter().filter(|s| s.enabled).count()
+    }
+
+    pub fn amp_values(&self) -> ParamVals {
+        self.amp_values
+    }
+
+    /// Drain and apply pending UI commands. Bounded so a pathological queue cannot stall
+    /// the callback; leftovers are picked up next block.
+    fn drain(&mut self, shared: &Shared) {
+        let mut queue = match shared.cmds.try_lock() {
+            Ok(q) => q,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        for _ in 0..64 {
+            let Some(cmd) = queue.pop_front() else { break };
+            self.apply(cmd);
+        }
+    }
+
+    fn apply(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::SetParam { slot, idx, norm } => {
+                if let Some(s) = self.slots.get_mut(slot) {
+                    if idx < s.kind.params().len() {
+                        // `norm` is already a knob position; clamp it, do NOT run it
+                        // through spec.norm() — that would normalise a second time.
+                        s.target.v[idx] = sanitize(norm, s.target.v[idx], 0.0, 1.0);
+                    }
+                }
+            }
+            Cmd::SetEnabled { slot, on } => {
+                if let Some(s) = self.slots.get_mut(slot) {
+                    s.enabled = on;
+                }
+            }
+            Cmd::InsertSlot { at, slot } => {
+                if self.slots.len() < MAX_SLOTS {
+                    let at = at.min(self.slots.len());
+                    let mut slot = slot;
+                    slot.proc.set_rates(self.sr);
+                    self.slots.insert(at, *slot);
+                }
+            }
+            Cmd::RemoveSlot { slot } => {
+                if slot < self.slots.len() {
+                    self.slots.remove(slot);
+                }
+            }
+            Cmd::MoveSlot { from, to } => {
+                if from < self.slots.len() {
+                    let to = to.min(self.slots.len() - 1);
+                    let s = self.slots.remove(from);
+                    self.slots.insert(to, s);
+                }
+            }
+            Cmd::LoadRack(slots) => {
+                let mut slots = slots;
+                slots.truncate(MAX_SLOTS);
+                for s in slots.iter_mut() {
+                    s.proc.set_rates(self.sr);
+                }
+                self.slots = slots;
+            }
+            Cmd::ReplaceSlot { slot, with } => {
+                if slot < self.slots.len() {
+                    let mut with = with;
+                    with.proc.set_rates(self.sr);
+                    self.slots[slot] = *with;
+                }
+            }
+            Cmd::AmpParam { idx, norm } => self.set_amp_param(idx, norm),
+            Cmd::Flag(flag, on) => match flag {
+                Flag::Cab => self.cab_on = on,
+                Flag::InputHpf => self.hpf_on = on,
+                Flag::Muted => self.muted = on,
+            },
+            Cmd::LoadIr(ir) => self.cab.load_ir(*ir),
+            Cmd::ClearIr => self.cab.clear_ir(),
+        }
+    }
+
+    /// Process `out.len()` output frames: pull input, run the chain, write out.
+    ///
+    /// Called from the output callback. `src` is the input side — a ring in the live app,
+    /// a slice in `--render` — which is why the engine does not care where audio comes
+    /// from. `shared` is `None` for the offline renderer.
+    pub fn process(&mut self, shared: Option<&Shared>, src: &mut dyn Source, out: &mut [Frame]) {
+        let t0 = shared.map(|_| Instant::now());
+        if let Some(shared) = shared {
+            self.drain(shared);
+        }
+        let need = out.len();
+        let mut done = 0;
+        self.cap_n = 0;
+        while done < need {
+            let n = (need - done).min(self.chunk);
+            self.advance_amp(n);
+            self.fill_scratch(src, n);
+            // Captured before the rack, because `run_chain` overwrites the scratch in
+            // place and the input side is gone by the time it returns.
+            let c = self.cap_n.min(MAX_CHUNK);
+            let take = n.min(MAX_CHUNK - c);
+            if take > 0 {
+                for i in 0..take {
+                    let f = self.scratch[c + i];
+                    self.cap_in[c + i] = 0.5 * (f[0] + f[1]);
+                }
+            }
+            self.run_chain(n);
+            let c2 = self.cap_n.min(MAX_CHUNK);
+            let take2 = n.min(MAX_CHUNK - c2);
+            for i in 0..take2 {
+                let f = self.scratch[c2 + i];
+                self.cap_out[c2 + i] = 0.5 * (f[0] + f[1]);
+            }
+            self.cap_n = (self.cap_n + n).min(MAX_CHUNK);
+            out[done..done + n].copy_from_slice(&self.scratch[..n]);
+            done += n;
+        }
+        if let (Some(t0), Some(shared)) = (t0, shared) {
+            // Overrun = the callback outlasted its own block, i.e. the next one is late.
+            let budget = need as f64 / self.sr.max(1.0) as f64;
+            let spent = t0.elapsed().as_secs_f64();
+            put(
+                &shared.stats.cpu_pct,
+                (spent / budget.max(1e-9) * 100.0) as f32,
+            );
+            if spent > budget {
+                self.overruns += 1;
+                shared
+                    .stats
+                    .overruns
+                    .store(self.overruns, Ordering::Relaxed);
+            }
+        }
+        self.publish(shared, src);
+    }
+
+    /// Smooth + denormalise the amp/global params for this chunk. Done before
+    /// `fill_scratch` so the input trim applies to *this* chunk, not last's.
+    fn advance_amp(&mut self, n: usize) {
+        let k = 1.0 - (-((n as f32) / (0.015 * self.sr.max(1.0))).exp());
+        for (i, spec) in AMP_SPECS.iter().enumerate() {
+            let t = self.amp_target.get(spec, i);
+            let cur = self.amp_smooth.v[i].clamp(0.0, 1.0);
+            self.amp_smooth.v[i] = cur + (t - cur) * k;
+            self.amp_values.v[i] = spec.denorm(self.amp_smooth.v[i]);
+        }
+    }
+
+    /// Resample `n` input frames into the stereo scratch buffer and gain-stage them.
+    fn fill_scratch(&mut self, src: &mut dyn Source, n: usize) {
+        // Two devices on independent clocks drift apart, so the input resampler's ratio
+        // is nudged to keep the ring centred on about half a block. Bounded to ±0.1 %,
+        // which is far below audible pitch change for a guitar.
+        let target = (self.sr * 0.005).max(32.0);
+        let level = src.level();
+        if self.step_base != 1.0 || level > 0 {
+            let err = (level as f32 - target) / (target * 8.0);
+            let corr = 1.0 + err.clamp(-0.001, 0.001);
+            self.step =
+                (self.step_base * corr).clamp(self.step_base * 0.999, self.step_base * 1.001);
+        } else {
+            self.step = 1.0;
+        }
+        self.resampler.set_step(self.step);
+        if level == 0 {
+            self.silent_run = self.silent_run.saturating_add(n as u64);
+            self.silent_max = self.silent_max.max(self.silent_run);
+        } else {
+            self.silent_run = 0;
+        }
+
+        let trim = db2lin(self.amp_values.v[amp_ix::TRIM]);
+        for f in self.scratch[..n].iter_mut() {
+            let raw = self.resampler.next(src);
+            // Stage 0, recorded at the device's level. "Is a guitar plugged in and open"
+            // cannot be answered after our own trim, which turns silence loud and a hot
+            // pick-up silent; and it must be this sample, not the previous block's.
+            if let Some(t) = self.taps.as_mut() {
+                t.push_mono(0, raw);
+            }
+            let mut x = raw * trim;
+            x = self.in_dc.process(x);
+            if self.hpf_on {
+                x = self.in_hpf.process(x);
+            }
+            // Clamp ahead of the rack: a clipped-at-source interface or a 40 dB trim
+            // should saturate the amp, not send +1e12 into a reverb comb.
+            let x = if x.is_finite() {
+                x.clamp(-8.0, 8.0)
+            } else {
+                0.0
+            };
+            self.meter_in.push(x);
+            *f = [x, x]; // a guitar is mono; time-based effects widen it later
+        }
+    }
+
+    fn run_chain(&mut self, n: usize) {
+        let buf = &mut self.scratch[..n];
+        let k = 1.0 - (-((n as f32) / (0.015 * self.sr.max(1.0))).exp());
+
+        // A disabled slot still gets its stage recorded (unchanged from the previous one):
+        // every stage must hold the same number of frames or the per-stage WAVs slide apart.
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.enabled {
+                slot.advance(k);
+                slot.proc.process(buf, n, &slot.values);
+            }
+            if let Some(t) = self.taps.as_mut() {
+                for f in buf.iter() {
+                    t.push(1 + i, f);
+                }
+            }
+        }
+
+        self.amp.process(buf, n, &self.amp_values);
+        let after_slots = 1 + self.slots.len();
+        if let Some(t) = self.taps.as_mut() {
+            for f in buf.iter() {
+                t.push(after_slots, f);
+            }
+        }
+        if self.cab_on {
+            self.cab.process(buf, n);
+        }
+        if let Some(t) = self.taps.as_mut() {
+            for f in buf.iter() {
+                t.push(after_slots + 1, f);
+            }
+        }
+
+        // Master taper: quadratic in linear gain, silence at 0, ~+1.6 dB wide open.
+        let master = if self.muted {
+            0.0
+        } else {
+            let m = self.amp_values.v[amp_ix::MASTER].clamp(0.0, 1.0);
+            m * m * 1.2
+        };
+        for f in buf.iter_mut() {
+            f[0] *= master;
+            f[1] *= master;
+            self.limiter.process(f, CEILING);
+            f[0] = self.out_dc.process(f[0]);
+            f[1] = self.out_dc.process(f[1]);
+            // Brickwall, deliberately last. The limiter above clamps to `CEILING`, but the
+            // DC blocker runs after it and is a highpass: on a clamped transient it can ring
+            // and put a sample back over the ceiling. This is what makes "no output sample
+            // exceeds full scale" true by construction rather than by trusting the stage
+            // order. (Its original comment cited a 0.976 overshoot that was measured while
+            // `set_amp_param` was mis-setting the amp -- a broken engine, so that figure is
+            // withdrawn; the ordering reason above stands on its own.)
+            f[0] = f[0].clamp(-FULL_SCALE, FULL_SCALE);
+            f[1] = f[1].clamp(-FULL_SCALE, FULL_SCALE);
+            self.meter_out.push_frame(f[0], f[1]);
+            if let Some(t) = self.taps.as_mut() {
+                t.push(after_slots + 2, f);
+            }
+        }
+    }
+
+    fn publish(&mut self, shared: Option<&Shared>, src: &dyn Source) {
+        let Some(shared) = shared else { return };
+        let s = &shared.stats;
+        let (ip, ir, ic) = self.meter_in.take();
+        let (op, orm, oc) = self.meter_out.take();
+        put(&s.in_peak, ip);
+        put(&s.in_rms, ir);
+        put(&s.out_peak, op);
+        put(&s.out_rms, orm);
+        put(&s.gr_db, self.limiter.reduction_db());
+        s.rate.store(self.sr as u32, Ordering::Relaxed);
+        put(&s.ratio, self.step / self.step_base.max(f32::MIN_POSITIVE));
+        s.buffer_frames.store(self.chunk as u32, Ordering::Relaxed);
+        s.ring_frames.store(src.level() as u32, Ordering::Relaxed);
+        if ic {
+            s.clip_in.fetch_add(1, Ordering::Relaxed);
+        }
+        if oc {
+            s.clip_out.fetch_add(1, Ordering::Relaxed);
+        }
+        s.underruns
+            .store(self.resampler.underruns(), Ordering::Relaxed);
+        self.publish_scope(shared);
+    }
+
+    /// Hand this block's captured window to the UI.
+    ///
+    /// `try_lock`, not `lock`: if the UI happens to be copying the window, this block is
+    /// simply not plotted. The alternative -- waiting -- puts an unbounded block on the
+    /// audio callback for the sake of a picture, which is exactly the trade the rest of
+    /// this file refuses to make.
+    fn publish_scope(&mut self, shared: &Shared) {
+        if !shared.scope_on.load(Ordering::Relaxed) || self.cap_n == 0 {
+            return;
+        }
+        let Ok(mut sc) = shared.scope.try_lock() else {
+            return;
+        };
+        let n = self.cap_n;
+        for i in 0..n {
+            if sc.din.len() >= SCOPE_FRAMES {
+                sc.din.pop_front();
+                sc.dout.pop_front();
+            }
+            sc.din.push_back(self.cap_in[i]);
+            sc.dout.push_back(self.cap_out[i]);
+        }
+        sc.sr = self.sr;
+        sc.seq = sc.seq.wrapping_add(1);
+    }
+
+    /// Consecutive blocks that arrived with an empty input ring. The UI turns this into
+    /// "check microphone permission" — on macOS a CLI-launched binary inherits its
+    /// terminal's permission, and a denial is silence rather than an error.
+    pub fn silent_frames(&self) -> u64 {
+        self.silent_run
+    }
+
+    /// The longest input gap seen since start-up, in frames.
+    pub fn silent_max(&self) -> u64 {
+        self.silent_max
+    }
+
+    /// Start recording every stage boundary, each up to `limit` frames.
+    ///
+    /// The stage list is fixed from the rack as it stands now: `input`, one per slot, `amp`,
+    /// `cab`, `out`. Adding or removing a slot afterwards shifts the indices, so this is a
+    /// trace/bring-up affordance, not something to leave on while editing; `TapLog` bounds
+    /// every push, so a rack change loses at worst a stage rather than sound.
+    pub fn enable_taps(&mut self, limit: usize) {
+        let mut names: Vec<String> = Vec::with_capacity(self.slots.len() + 3);
+        names.push("input".into());
+        for (i, s) in self.slots.iter().enumerate() {
+            names.push(format!("{}.{}", i, s.kind.short()));
+        }
+        names.push("amp".into());
+        names.push("cab".into());
+        names.push("out".into());
+        // Leaked on purpose: a handful of stage names, once per trace. Interning them in
+        // TapStage as `String` would mean threading lifetimes through a debug affordance.
+        let names: Vec<&'static str> = names
+            .into_iter()
+            .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
+            .collect();
+        self.taps = Some(crate::taps::TapLog::new(&names, limit));
+    }
+
+    /// Frames currently recorded per stage (0 when taps are off).
+    pub fn tap_len(&self) -> usize {
+        self.taps.as_ref().map_or(0, |t| t.len())
+    }
+
+    /// The recorder itself, for measuring or writing out after a run.
+    pub fn taps(&self) -> Option<&crate::taps::TapLog> {
+        self.taps.as_ref()
+    }
+
+    pub fn overruns(&self) -> u64 {
+        self.overruns
+    }
+
+    pub fn limiter(&self) -> &Limiter {
+        &self.limiter
+    }
+
+    /// Replace the whole rack (preset load). Audio-thread side of a preset apply.
+    pub fn load_rack(&mut self, slots: Vec<Slot>) {
+        self.slots.clear();
+        for mut s in slots.into_iter().take(MAX_SLOTS) {
+            s.proc.set_rates(self.sr);
+            self.slots.push(s);
+        }
+    }
+
+    /// Move an amp knob to a **normalised** position (`0.0..=1.0`) -- the same units the UI
+    /// sends and the same units `amp_target` stores.
+    ///
+    /// This used to be `spec.norm(norm)`, which normalised a value that was already
+    /// normalised. On the linear knobs that merely read wrong; on `master`, whose curve is
+    /// exponential over `0.0..=1.0`, 0.3 came back as ~0.8 -- about +8 dB straight into the
+    /// power-amp shaper, which then squared off on any real input. The UI calls this setter
+    /// directly when it pushes its knob state, so it was audible in the live app, not just
+    /// in offline renders. Keep this and the mailbox path sharing one definition.
+    pub fn set_amp_param(&mut self, idx: usize, norm: f32) {
+        if let Some(spec) = AMP_SPECS.get(idx) {
+            self.amp_target.v[idx] = sanitize(norm, spec.default_norm(), 0.0, 1.0);
+        }
+    }
+
+    pub fn flags(&self) -> (bool, bool, bool) {
+        (self.cab_on, self.hpf_on, self.muted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preset::Preset;
+
+    struct Const(f32);
+    impl Source for Const {
+        fn read(&mut self, dst: &mut [f32]) -> usize {
+            dst.iter_mut().for_each(|s| *s = self.0);
+            dst.len()
+        }
+        fn level(&self) -> usize {
+            0
+        }
+    }
+
+    /// Both amp-knob paths have to mean the same thing: a normalised position in, the spec's
+    /// real value out. `set_amp_param` once re-normalised what it was handed, so the factory
+    /// positions landed in the wrong places -- `master` 0.3 became ~0.8 and the amp buzzed on
+    /// any input. The UI pushes knobs through this exact setter, so the regression is audible
+    /// rather than theoretical, and this test is what keeps the two units straight.
+    #[test]
+    fn amp_knobs_land_where_the_caller_put_them() {
+        let mut e = Engine::new(48_000.0, 256);
+        for (i, spec) in AMP_SPECS.iter().enumerate() {
+            e.set_amp_param(i, spec.default_norm());
+        }
+        let mut src = Const(0.0);
+        let mut buf = [[0.0f32; 2]; 256];
+        for _ in 0..64 {
+            e.process(None, &mut src, &mut buf);
+        }
+        let v = e.amp_values();
+        for (i, spec) in AMP_SPECS.iter().enumerate() {
+            assert!(
+                (v.v[i] - spec.default).abs() <= spec.default.abs() * 0.02 + 0.02,
+                "knob {} ({}) at its factory position landed at {:.3}, expected {:.3}",
+                i,
+                spec.name,
+                v.v[i],
+                spec.default
+            );
+        }
+    }
+
+    /// Dead for the first `gap` blocks, alive afterwards -- how a microphone comes back.
+    /// A cumulative starved counter cannot tell this apart from an input that never
+    /// returned, and the UI's "check your input" warning depends on telling them apart.
+    struct DeadThenLive {
+        gap: usize,
+        blocks: usize,
+    }
+    impl Source for DeadThenLive {
+        fn read(&mut self, dst: &mut [f32]) -> usize {
+            self.blocks += 1;
+            dst.iter_mut().for_each(|s| *s = 0.0);
+            if self.blocks <= self.gap {
+                0
+            } else {
+                dst.len()
+            }
+        }
+        fn level(&self) -> usize {
+            if self.blocks < self.gap {
+                0
+            } else {
+                8192
+            }
+        }
+    }
+
+    #[test]
+    fn an_input_gap_is_counted_as_a_run_and_clears_when_input_returns() {
+        let mut e = Engine::new(48000.0, 64);
+        let mut buf = [[0.0f32; 2]; 64];
+        let mut src = DeadThenLive { gap: 6, blocks: 0 };
+        e.process(None, &mut src, &mut buf);
+        assert!(
+            e.silent_frames() > 0,
+            "a dead input must register while it is dead"
+        );
+        // How many times the resampler pulls per block is its own business, so the assertions
+        // below are about the semantics: the live figure clears, the historical one does not.
+        for _ in 0..12 {
+            e.process(None, &mut src, &mut buf);
+        }
+        assert_eq!(
+            e.silent_frames(),
+            0,
+            "input returned, so the live warning must clear"
+        );
+        assert!(e.silent_max() > 0, "the worst gap stays on the record");
+    }
+
+    struct Silent;
+    impl Source for Silent {
+        fn read(&mut self, dst: &mut [f32]) -> usize {
+            dst.iter_mut().for_each(|s| *s = 0.0);
+            dst.len()
+        }
+        fn level(&self) -> usize {
+            0
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(48000.0, 128)
+    }
+
+    #[test]
+    fn engine_starts_empty_and_clean() {
+        let mut e = engine();
+        e.slots.reserve(MAX_SLOTS);
+        assert!(
+            e.slots.capacity() >= MAX_SLOTS,
+            "no realloc on the audio thread"
+        );
+        let mut out = [[0.1f32; 2]; 64];
+        e.process(None, &mut Silent, &mut out);
+        assert_eq!(
+            out.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0
+        );
+        assert_eq!(e.active_slots(), 0);
+    }
+
+    #[test]
+    fn mailbox_commands_apply_in_order_and_bad_indices_are_ignored() {
+        let shared = Shared::new();
+        let mut e = engine();
+        shared.send(Cmd::InsertSlot {
+            at: 0,
+            slot: Box::new(Slot::build(EffectKind::Boost, false, 48000.0)),
+        });
+        shared.send(Cmd::SetEnabled { slot: 0, on: true });
+        shared.send(Cmd::SetParam {
+            slot: 0,
+            idx: 0,
+            norm: 0.8,
+        });
+        shared.send(Cmd::SetParam {
+            slot: 7,
+            idx: 3,
+            norm: 0.5,
+        }); // no such slot
+        shared.send(Cmd::SetParam {
+            slot: 0,
+            idx: 99,
+            norm: 0.5,
+        }); // no such param
+        shared.send(Cmd::RemoveSlot { slot: 3 }); // out of range
+        let mut out = [[0.0f32; 2]; 32];
+        e.process(Some(&shared), &mut Silent, &mut out);
+        assert_eq!(e.slots.len(), 1);
+        assert!(e.slots[0].enabled);
+        assert!((e.slots[0].target.v[0] - 0.8).abs() < 1e-3);
+        assert!(shared.cmds.lock().unwrap().is_empty(), "queue must drain");
+    }
+
+    #[test]
+    fn inserting_beyond_max_slots_is_refused_not_panicky() {
+        let shared = Shared::new();
+        let mut e = engine();
+        for i in 0..(MAX_SLOTS + 6) {
+            shared.send(Cmd::InsertSlot {
+                at: i,
+                slot: Box::new(Slot::build(EffectKind::Boost, true, 48000.0)),
+            });
+        }
+        let mut out = [[0.0f32; 2]; 16];
+        e.process(Some(&shared), &mut Silent, &mut out);
+        assert_eq!(e.slots.len(), MAX_SLOTS);
+    }
+
+    #[test]
+    fn reordering_moves_state_and_bypass_silences_only_its_own_slot() {
+        let mut e = engine();
+        e.slots.push(Slot::build(EffectKind::Delay, true, 48000.0));
+        e.slots.push(Slot::build(EffectKind::Reverb, true, 48000.0));
+        let first = e.slots[0].kind;
+        let shared = Shared::new();
+        shared.send(Cmd::MoveSlot { from: 0, to: 1 });
+        shared.send(Cmd::SetEnabled { slot: 0, on: false });
+        let mut out = [[0.0f32; 2]; 16];
+        e.process(Some(&shared), &mut Silent, &mut out);
+        assert_eq!(
+            e.slots[1].kind, first,
+            "moved slot keeps its kind and state"
+        );
+        assert!(!e.slots[0].enabled);
+        assert_eq!(e.active_slots(), 1);
+    }
+
+    #[test]
+    fn every_effect_stays_in_range_with_every_knob_maxed() {
+        struct Hot(usize);
+        impl Source for Hot {
+            fn read(&mut self, dst: &mut [f32]) -> usize {
+                for s in dst.iter_mut() {
+                    *s = if self.0 % 8 < 4 { 3.0 } else { -3.0 };
+                    self.0 += 1;
+                }
+                dst.len()
+            }
+            fn level(&self) -> usize {
+                0
+            }
+        }
+        for kind in EffectKind::ALL {
+            let mut e = engine();
+            e.slots.push(Slot::build(kind, true, 48000.0));
+            for i in 0..kind.params().len() {
+                e.slots[0].target.v[i] = 1.0;
+                e.slots[0].smooth.v[i] = 1.0;
+            }
+            for i in [amp_ix::GAIN, amp_ix::MASTER, amp_ix::TRIM, amp_ix::TREBLE] {
+                e.amp_target.v[i] = 1.0;
+                e.amp_smooth.v[i] = 1.0;
+            }
+            let mut src = Hot(0);
+            let mut out = [[0.0f32; 2]; 256];
+            let mut worst = 0.0f32;
+            for _ in 0..60 {
+                e.process(None, &mut src, &mut out);
+                for f in out.iter() {
+                    assert!(
+                        f[0].is_finite() && f[1].is_finite(),
+                        "{kind:?} produced NaN"
+                    );
+                    worst = worst.max(f[0].abs()).max(f[1].abs());
+                }
+            }
+            assert!(worst <= 1.0, "{kind:?} leaked peak {worst}");
+        }
+    }
+
+    #[test]
+    fn every_effect_stays_in_range_with_every_knob_min() {
+        struct Ramp(usize);
+        impl Source for Ramp {
+            fn read(&mut self, dst: &mut [f32]) -> usize {
+                for s in dst.iter_mut() {
+                    *s = ((self.0 as f32) * 0.01).sin() * 0.8;
+                    self.0 += 1;
+                }
+                dst.len()
+            }
+            fn level(&self) -> usize {
+                0
+            }
+        }
+        for kind in EffectKind::ALL {
+            let mut e = engine();
+            e.slots.push(Slot::build(kind, true, 48000.0));
+            let mut src = Ramp(0);
+            let mut out = [[0.0f32; 2]; 128];
+            for _ in 0..40 {
+                e.process(None, &mut src, &mut out);
+                for f in out.iter() {
+                    assert!(
+                        f[0].is_finite() && f[1].is_finite(),
+                        "{kind:?} min-knob NaN"
+                    );
+                    assert!(f[0].abs() <= 1.0, "{kind:?} peak {}", f[0].abs());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_preset_passes_signal_and_strips_input_dc() {
+        let mut e = engine();
+        let p = Preset::blues();
+        e.load_rack(p.to_slots(48000.0));
+        struct SinePlusDc(usize);
+        impl Source for SinePlusDc {
+            fn read(&mut self, dst: &mut [f32]) -> usize {
+                for s in dst.iter_mut() {
+                    // sine plus a real DC offset, the kind a cheap interface adds
+                    *s = ((self.0 as f32) * 0.05).sin() * 0.5 + 0.2;
+                    self.0 += 1;
+                }
+                dst.len()
+            }
+            fn level(&self) -> usize {
+                0
+            }
+        }
+        let mut src = SinePlusDc(0);
+        let mut out = [[0.0f32; 2]; 512];
+        let (mut peak, mut dc_sum, mut n) = (0.0f32, 0.0f64, 0usize);
+        for _ in 0..40 {
+            e.process(None, &mut src, &mut out);
+            for f in out.iter() {
+                peak = peak.max(f[0].abs());
+                dc_sum += f[0] as f64;
+                n += 1;
+            }
+        }
+        assert!(
+            peak > 0.01,
+            "default preset should pass signal, peak {peak}"
+        );
+        assert!(peak <= 1.0);
+        let dc = (dc_sum / n as f64).abs();
+        assert!(dc < 0.02, "output must not carry DC, got {dc}");
+    }
+
+    #[test]
+    fn mute_switch_really_silences_the_output() {
+        let shared = Shared::new();
+        let mut e = engine();
+        e.slots.push(Slot::build(EffectKind::Boost, true, 48000.0));
+        shared.send(Cmd::Flag(Flag::Muted, true));
+        let mut src = Const(0.5);
+        let mut out = [[0.0f32; 2]; 256];
+        for _ in 0..20 {
+            e.process(Some(&shared), &mut src, &mut out);
+        }
+        assert!(
+            out.iter().flatten().all(|s| s.abs() < 1e-6),
+            "muted output leaked"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_mailbox_still_gets_drained() {
+        let shared = Shared::new();
+        {
+            let s = shared.clone();
+            let _ = std::panic::catch_unwind(move || {
+                let _g = s.cmds.lock().unwrap();
+                panic!("ui thread died holding the queue");
+            });
+        }
+        assert!(shared.cmds.is_poisoned());
+        shared.send(Cmd::Flag(Flag::Cab, false));
+        let mut e = engine();
+        let mut out = [[0.0f32; 2]; 8];
+        e.process(Some(&shared), &mut Silent, &mut out);
+        assert!(!e.flags().0, "commands after poisoning must still apply");
+        assert_eq!(shared.status(), String::new());
+    }
+
+    #[test]
+    fn stats_publish_finite_numbers() {
+        let shared = Shared::new();
+        let mut e = engine();
+        e.slots.push(Slot::build(EffectKind::Reverb, true, 48000.0));
+        let mut src = Const(0.3);
+        let mut out = [[0.0f32; 2]; 128];
+        for _ in 0..10 {
+            e.process(Some(&shared), &mut src, &mut out);
+        }
+        let s = shared.stats.snapshot();
+        assert!(s.in_peak > 0.0 && s.in_peak <= 8.0, "in_peak {}", s.in_peak);
+        assert!(s.out_peak.is_finite() && s.out_peak <= 1.0);
+        assert!(s.cpu_pct.is_finite() && s.cpu_pct >= 0.0);
+        assert!(s.gr_db <= 0.001 && s.gr_db > -80.0, "gr_db {}", s.gr_db);
+        assert_eq!(s.rate, 48000);
+    }
+
+    #[test]
+    fn rate_change_propagates_to_every_slot_and_stays_stable() {
+        let mut e = engine();
+        for k in EffectKind::ALL {
+            e.slots.push(Slot::build(k, true, 48000.0));
+        }
+        e.set_rates(44100.0, 96000.0);
+        assert_eq!(e.sr(), 96000.0);
+        assert!((e.step_base - 44100.0 / 96000.0).abs() < 1e-6);
+        struct R(usize);
+        impl Source for R {
+            fn read(&mut self, dst: &mut [f32]) -> usize {
+                for s in dst.iter_mut() {
+                    *s = ((self.0 as f32) * 0.02).sin() * 0.6;
+                    self.0 += 1;
+                }
+                dst.len()
+            }
+            fn level(&self) -> usize {
+                100
+            }
+        }
+        let mut src = R(0);
+        let mut out = [[0.0f32; 2]; 256];
+        for _ in 0..40 {
+            e.process(None, &mut src, &mut out);
+            for f in out.iter() {
+                assert!(
+                    f[0].is_finite() && f[1].is_finite(),
+                    "non-finite across rate change"
+                );
+                assert!(f[0].abs() <= 1.0);
+            }
+        }
+    }
+}

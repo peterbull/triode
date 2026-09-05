@@ -1,0 +1,20 @@
+[package]
+name = "triode"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time guitar amplifier with a stompbox effects rack"
+license = "MIT"
+
+[dependencies]
+cpal = "0.18"
+eframe = "0.36"
+egui = "0.36"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+
+# The DSP runs inside an audio callback; an unoptimised debug build cannot keep
+# up, so `cargo run` (debug) gets light optimisation. `--render` is usable either way.
