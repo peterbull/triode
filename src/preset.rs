@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_omar_effect_names_are_stable_json_contracts() {
+    fn existing_effect_names_are_stable_json_contracts() {
         for (kind, spelling) in [
             (EffectKind::Gate, "\"Gate\""),
             (EffectKind::Compressor, "\"Compressor\""),
@@ -331,12 +331,15 @@ mod tests {
             (EffectKind::Fuzz, "\"Fuzz\""),
             (EffectKind::ParametricEq, "\"ParametricEq\""),
             (EffectKind::EnvelopeFilter, "\"EnvelopeFilter\""),
+            (EffectKind::StepFilter, "\"StepFilter\""),
             (EffectKind::Tremolo, "\"Tremolo\""),
             (EffectKind::Phaser, "\"Phaser\""),
             (EffectKind::Flanger, "\"Flanger\""),
             (EffectKind::Chorus, "\"Chorus\""),
+            (EffectKind::RingModulator, "\"RingModulator\""),
             (EffectKind::BitCrusher, "\"BitCrusher\""),
             (EffectKind::Delay, "\"Delay\""),
+            (EffectKind::AnalogDelay, "\"AnalogDelay\""),
             (EffectKind::Reverb, "\"Reverb\""),
         ] {
             let json = serde_json::to_string(&kind).unwrap();
@@ -348,9 +351,8 @@ mod tests {
     #[test]
     fn new_effect_names_are_stable_json_contracts() {
         for (kind, spelling) in [
-            (EffectKind::StepFilter, "\"StepFilter\""),
-            (EffectKind::RingModulator, "\"RingModulator\""),
-            (EffectKind::AnalogDelay, "\"AnalogDelay\""),
+            (EffectKind::ReverseDelay, "\"ReverseDelay\""),
+            (EffectKind::PitchShifter, "\"PitchShifter\""),
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, spelling);

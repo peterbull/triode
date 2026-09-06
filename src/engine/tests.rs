@@ -1,4 +1,5 @@
 use super::*;
+use crate::dsp::fx::{pitch_shifter, reverse_delay};
 use crate::params::EffectKind;
 use crate::preset::Preset;
 
@@ -282,9 +283,7 @@ fn every_effect_stays_in_range_with_every_knob_min() {
 fn twelve_slot_mixed_effect_rack_stays_finite_and_bounded() {
     let mut e = engine();
     let kinds = [
-        EffectKind::Gate,
         EffectKind::Compressor,
-        EffectKind::Boost,
         EffectKind::Overdrive,
         EffectKind::Fuzz,
         EffectKind::ParametricEq,
@@ -294,6 +293,8 @@ fn twelve_slot_mixed_effect_rack_stays_finite_and_bounded() {
         EffectKind::Delay,
         EffectKind::AnalogDelay,
         EffectKind::Reverb,
+        EffectKind::ReverseDelay,
+        EffectKind::PitchShifter,
     ];
     assert_eq!(kinds.len(), MAX_SLOTS);
     for (slot_index, kind) in kinds.into_iter().enumerate() {
@@ -306,6 +307,19 @@ fn twelve_slot_mixed_effect_rack_stays_finite_and_bounded() {
             };
             slot.target.v[parameter] = norm;
             slot.smooth.v[parameter] = norm;
+        }
+        match kind {
+            EffectKind::ReverseDelay => {
+                slot.target.v[reverse_delay::MIX] = 1.0;
+                slot.smooth.v[reverse_delay::MIX] = 1.0;
+            }
+            EffectKind::PitchShifter => {
+                slot.target.v[pitch_shifter::BEND] = 0.75;
+                slot.smooth.v[pitch_shifter::BEND] = 0.75;
+                slot.target.v[pitch_shifter::MIX] = 0.75;
+                slot.smooth.v[pitch_shifter::MIX] = 0.75;
+            }
+            _ => {}
         }
         e.slots.push(slot);
     }

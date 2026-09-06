@@ -72,6 +72,8 @@ fn replacement_reaches_engine_and_resets_params_without_rearming_bypass() {
         EffectKind::StepFilter,
         EffectKind::RingModulator,
         EffectKind::AnalogDelay,
+        EffectKind::ReverseDelay,
+        EffectKind::PitchShifter,
     ] {
         let mut preset = rack(&[EffectKind::Gate]);
         preset.slots[0].enabled = false;
@@ -193,6 +195,47 @@ fn pedal_cards_keep_their_width_and_wrap_into_rows() {
         rects[2].min.y >= rects[0].max.y,
         "third card must wrap: {rects:?}"
     );
+}
+
+#[test]
+fn new_pedal_cards_stay_within_target_viewports() {
+    for size in [[880.0, 560.0], [1600.0, 1000.0]] {
+        for kind in [EffectKind::ReverseDelay, EffectKind::PitchShifter] {
+            let context = egui::Context::default();
+            let slots = mirror(&rack(&[kind]));
+            let mut card = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::Vec2::from(size))),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                        |ui| {
+                            let (_, rect, _) = App::slot_card(ui, &slots[0], 0, &mut None);
+                            card = Some(rect);
+                        },
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            let card = card.expect("slot_card must return its card bounds");
+            assert!(
+                card.min.x.is_finite()
+                    && card.min.y.is_finite()
+                    && card.max.x.is_finite()
+                    && card.max.y.is_finite()
+                    && card.width() > 0.0
+                    && card.height() > 0.0,
+                "{kind:?} invalid card bounds at {size:?}: {card:?}"
+            );
+            assert!(
+                card.max.x <= size[0],
+                "{kind:?} card overflowed at {size:?}: {card:?}"
+            );
+        }
+    }
 }
 
 #[test]

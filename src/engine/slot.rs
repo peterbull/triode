@@ -88,5 +88,7 @@ pub fn make_proc(kind: EffectKind) -> Box<dyn Proc> {
         EffectKind::Delay => Box::new(fx::delay::StereoDelay::new()),
         EffectKind::AnalogDelay => Box::new(fx::analog_delay::AnalogDelay::new()),
         EffectKind::Reverb => Box::new(fx::reverb::Reverb::new()),
+        EffectKind::ReverseDelay => Box::new(fx::reverse_delay::ReverseDelay::new()),
+        EffectKind::PitchShifter => Box::new(fx::pitch_shifter::PitchShifter::new()),
     }
 }

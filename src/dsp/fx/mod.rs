@@ -1,4 +1,4 @@
-//! Seventeen stompbox effects. Each is a [`crate::engine::Proc`]: no allocation,
+//! Nineteen stompbox effects. Each is a [`crate::engine::Proc`]: no allocation,
 //! locking or blocking inside `process`, and all parameter indexes match the tables
 //! in [`crate::params`] exactly (a test asserts the counts so a spec edit cannot
 //! silently desync an effect).
@@ -15,7 +15,9 @@ pub mod eq;
 pub mod flanger;
 pub mod gate;
 pub mod phaser;
+pub mod pitch_shifter;
 pub mod reverb;
+pub mod reverse_delay;
 pub mod ring_mod;
 pub mod step_filter;
 pub mod trem;
@@ -53,6 +55,16 @@ mod tests {
                 "{kind:?} junk"
             );
             let _ = make_proc(kind);
+        }
+    }
+
+    #[test]
+    fn new_effects_are_registered_processors() {
+        for kind in [EffectKind::ReverseDelay, EffectKind::PitchShifter] {
+            let mut proc = make_proc(kind);
+            let mut buf = [[0.1f32, -0.1]; 64];
+            proc.process(&mut buf, 64, &kind.default_values());
+            assert!(buf.iter().flatten().all(|sample| sample.is_finite()));
         }
     }
 }

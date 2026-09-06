@@ -233,15 +233,31 @@ pub fn render(input: &Path, output: &Path, opts: &Options) -> Result<Report, Str
     Ok(report)
 }
 
+/// Built-in trace input. [`TraceProbe::Sine`] preserves the original trace signal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TraceProbe {
+    #[default]
+    Sine,
+    Tail,
+}
+
 /// One measured stage boundary.
 #[derive(Clone, Debug)]
 pub struct StageReport {
     pub name: String,
     pub peak: f32,
     pub rms: f32,
+    /// Left DC, retained for compatibility.
     pub dc: f32,
-    /// Only meaningful for the built-in sine input; 0.0 when a file was used.
+    pub dc_right: f32,
+    /// Only meaningful for the built-in sine input; 0.0 for Tail and WAV input.
     pub thd: f32,
+    pub non_finite: bool,
+    /// RMS after the excitation; present only for [`TraceProbe::Tail`].
+    pub tail_early_rms: Option<f32>,
+    pub tail_final_rms: Option<f32>,
+    /// Final-window energy relative to early-tail energy, in dB.
+    pub tail_decay_db: Option<f32>,
 }
 
 impl StageReport {
@@ -249,21 +265,75 @@ impl StageReport {
     pub fn quiet(&self) -> bool {
         self.peak < 1e-5
     }
+
+    /// An energetic tail that is flat or growing is a feedback/decay fault.
+    pub fn tail_stalled(&self) -> bool {
+        self.tail_final_rms.is_some_and(|rms| rms >= 1e-4)
+            && self
+                .tail_decay_db
+                .is_some_and(|db| db.is_finite() && db >= 0.0)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.non_finite || self.quiet() || self.tail_stalled()
+    }
 }
 
 /// The frequency the built-in trace signal is generated at.
 pub const TEST_HZ: f32 = 110.0;
 
+/// Two seconds with three short bursts at the front; the existing render tail follows it.
+fn tail_input() -> Vec<f32> {
+    let sr = 48_000;
+    let mut input = vec![0.0; sr * 2];
+    for (start, hz) in [(0, 110.0), (sr * 2 / 25, 440.0), (sr * 4 / 25, 1760.0)] {
+        let burst = analysis::sine(sr * 3 / 50, hz, sr as f32, 0.1);
+        input[start..start + burst.len()].copy_from_slice(&burst);
+    }
+    input
+}
+
+fn stereo_peak(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .chain(right)
+        .fold(0.0, |peak, sample| peak.max(sample.abs()))
+}
+
+fn stereo_rms(left: &[f32], right: &[f32]) -> f32 {
+    let n = left.len() + right.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let energy: f64 = left
+        .iter()
+        .chain(right)
+        .map(|sample| (*sample as f64).powi(2))
+        .sum();
+    (energy / n as f64).sqrt() as f32
+}
+
+fn tail_metric(left: &[f32], right: &[f32], sr: u32) -> (Option<f32>, Option<f32>, Option<f32>) {
+    let window = sr as usize * 2;
+    let early = window;
+    let end = left.len().min(right.len());
+    if window == 0 || end < window * 2 || early + window > end {
+        return (None, None, None);
+    }
+    // A maximum reverse-delay window unfolds from 2–4 s, so compare that whole first
+    // return with the final 4–6 s. Broad windows cannot land between sparse delay repeats.
+    let early_rms = stereo_rms(&left[early..early + window], &right[early..early + window]);
+    let final_rms = stereo_rms(&left[end - window..end], &right[end - window..end]);
+    (
+        Some(early_rms),
+        Some(final_rms),
+        Some(20.0 * (final_rms / early_rms.max(f32::MIN_POSITIVE)).log10()),
+    )
+}
+
 /// Run the engine with every stage boundary recorded, and measure each one.
 ///
-/// This exists because a silent output cannot tell you *where* the signal died, and the
-/// obvious answer ("the output is quiet") is indistinguishable from a legitimately quiet
-/// patch. With no input file it generates a -20 dBFS [`TEST_HZ`] sine, so a trace always has
-/// something to say and per-stage THD is meaningful: it shows the exact stage where
-/// distortion appears instead of implicating the whole chain.
-///
-/// Pass `dir` to also write one WAV per stage, which is the difference between reading a
-/// number and hearing the fuzz stage.
+/// This preserves the original sine trace API. Use [`trace_with_probe`] to choose a different
+/// deterministic built-in input.
 pub fn trace(
     input: Option<&Path>,
     preset: &Preset,
@@ -271,19 +341,33 @@ pub fn trace(
     rate: Option<u32>,
     dir: Option<&Path>,
 ) -> Result<(u32, Vec<StageReport>), String> {
+    trace_with_probe(input, preset, chunk, rate, dir, TraceProbe::Sine)
+}
+
+/// Like [`trace`], with an explicit built-in probe when `input` is absent.
+pub fn trace_with_probe(
+    input: Option<&Path>,
+    preset: &Preset,
+    chunk: usize,
+    rate: Option<u32>,
+    dir: Option<&Path>,
+    probe: TraceProbe,
+) -> Result<(u32, Vec<StageReport>), String> {
     let chunk = chunk.clamp(1, MAX_CHUNK);
-    // A generated signal means `thd` is a real measurement; a borrowed file's fundamental is
-    // unknown, so THD is left at 0 rather than invented.
-    let (mono, file_sr, generated) = match input {
+    let (mono, file_sr, sine, tail) = match input {
         Some(p) => {
             let (m, sr) = read_wav_mono(p)?;
-            (m, sr, false)
+            (m, sr, false, false)
         }
-        None => (
-            analysis::sine(48000 * 2, TEST_HZ, 48000.0, 0.1),
-            48_000,
-            true,
-        ),
+        None => match probe {
+            TraceProbe::Sine => (
+                analysis::sine(48_000 * 2, TEST_HZ, 48_000.0, 0.1),
+                48_000,
+                true,
+                false,
+            ),
+            TraceProbe::Tail => (tail_input(), 48_000, false, true),
+        },
     };
     if mono.is_empty() {
         return Err("nothing to trace: the input has no samples".into());
@@ -291,7 +375,12 @@ pub fn trace(
     let sr = rate.unwrap_or(file_sr).clamp(8000, 192_000);
     let (mut engine, _shared) = engine_from_preset(preset, sr as f32, chunk);
     engine.set_rates(file_sr as f32, sr as f32);
-    let chunks = total_chunks(mono.len(), file_sr, chunk, sr);
+    let chunks = total_chunks(mono.len(), file_sr, chunk, sr)
+        + if tail {
+            (2 * sr as usize).div_ceil(chunk)
+        } else {
+            0
+        };
     engine.enable_taps(chunks * chunk);
 
     let mut src = SliceSource::new(&mono);
@@ -304,16 +393,32 @@ pub fn trace(
     let reports = taps
         .stages
         .iter()
-        .map(|st| StageReport {
-            name: st.name.clone(),
-            peak: analysis::peak(&st.data),
-            rms: analysis::rms(&st.data),
-            dc: analysis::mean(&st.data),
-            thd: if generated {
-                analysis::thd(&st.data, TEST_HZ, sr as f32)
+        .map(|st| {
+            let (tail_early_rms, tail_final_rms, tail_decay_db) = if tail {
+                tail_metric(&st.data, &st.right, sr)
             } else {
-                0.0
-            },
+                (None, None, None)
+            };
+            StageReport {
+                name: st.name.clone(),
+                peak: stereo_peak(&st.data, &st.right),
+                rms: stereo_rms(&st.data, &st.right),
+                dc: analysis::mean(&st.data),
+                dc_right: analysis::mean(&st.right),
+                thd: if sine {
+                    analysis::thd(&st.data, TEST_HZ, sr as f32)
+                } else {
+                    0.0
+                },
+                non_finite: st
+                    .data
+                    .iter()
+                    .chain(&st.right)
+                    .any(|sample| !sample.is_finite()),
+                tail_early_rms,
+                tail_final_rms,
+                tail_decay_db,
+            }
         })
         .collect();
     if let Some(d) = dir {
@@ -348,6 +453,96 @@ mod tests {
             assert_eq!(samples, vec![0.25], "{bits}-bit scaling");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tail_probe_is_deterministic_finite_and_two_seconds_long() {
+        let first = tail_input();
+        assert_eq!(first, tail_input());
+        assert_eq!(first.len(), 48_000 * 2);
+        assert!(first.iter().all(|sample| sample.is_finite()));
+        assert!(first.iter().any(|sample| *sample != 0.0));
+        assert!(first[48_000 / 4..].iter().all(|sample| *sample == 0.0));
+
+        let (_, stages) = trace_with_probe(
+            None,
+            &Preset::empty(),
+            128,
+            Some(48_000),
+            None,
+            TraceProbe::Tail,
+        )
+        .unwrap();
+        assert!(stages
+            .iter()
+            .all(|stage| !stage.non_finite && stage.thd == 0.0));
+        assert!(stages.iter().all(|stage| stage.tail_decay_db.is_some()));
+    }
+
+    #[test]
+    fn anti_phase_stereo_has_energy() {
+        assert_eq!(stereo_peak(&[0.5], &[-0.5]), 0.5);
+        assert!((stereo_rms(&[0.5], &[-0.5]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_energetic_non_decaying_tail_is_a_failure() {
+        let stage = StageReport {
+            name: "test".into(),
+            peak: 0.1,
+            rms: 0.1,
+            dc: 0.0,
+            dc_right: 0.0,
+            thd: 0.0,
+            non_finite: false,
+            tail_early_rms: Some(0.1),
+            tail_final_rms: Some(0.1),
+            tail_decay_db: Some(0.0),
+        };
+        assert!(stage.tail_stalled());
+        assert!(stage.failed());
+    }
+
+    #[test]
+    fn a_late_tail_is_a_failure_even_if_the_early_window_was_silent() {
+        let stage = StageReport {
+            name: "late echo".into(),
+            peak: 0.1,
+            rms: 0.01,
+            dc: 0.0,
+            dc_right: 0.0,
+            thd: 0.0,
+            non_finite: false,
+            tail_early_rms: Some(0.0),
+            tail_final_rms: Some(0.01),
+            tail_decay_db: Some(120.0),
+        };
+        assert!(stage.tail_stalled());
+    }
+
+    #[test]
+    fn increased_delay_feedback_leaves_more_tail_energy_without_instability() {
+        let trace_delay = |feedback| {
+            let mut preset = Preset::empty();
+            preset.slots.push(crate::preset::SlotPreset::with_values(
+                crate::params::EffectKind::Delay,
+                &[200.0, feedback, 0.8, 3400.0],
+            ));
+            trace_with_probe(None, &preset, 128, Some(48_000), None, TraceProbe::Tail)
+                .unwrap()
+                .1
+                .pop()
+                .unwrap()
+        };
+        let low = trace_delay(0.1);
+        let high = trace_delay(0.7);
+        assert!(
+            high.tail_early_rms.unwrap() > low.tail_early_rms.unwrap() * 2.0,
+            "feedback did not increase tail energy: {:?} -> {:?}",
+            low.tail_early_rms,
+            high.tail_early_rms
+        );
+        assert!(!high.non_finite);
     }
 
     #[test]

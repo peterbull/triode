@@ -23,8 +23,8 @@ Triode — guitar amp + stompbox rack
   triode trace [IN.wav]         measure every stage boundary; writes per-stage WAVs
   triode capture OUT.wav        record the input device to a WAV to trace or render later
 
-`trace` with no input file generates a -20 dBFS 110 Hz sine, so it always reports
-something and per-stage THD shows exactly which stage adds distortion.
+`trace` with no input file generates a -20 dBFS 110 Hz sine by default; use
+`--probe tail` for a deterministic multi-band burst and decay check.
 
 options
   --preset <name|file.json>   built-in/saved preset name, or a JSON file
@@ -33,6 +33,7 @@ options
   --output <name>             playback device (default: system default)
   --rate <hz>                 render: force this sample rate
   --chunk <frames>            render/trace: engine chunk size, <=512 (default 256)
+  --probe <sine|tail>         trace: built-in input (cannot combine with IN.wav)
   --input-on              arm the input at startup (default: output only, no howl)
   --seconds <n>               capture: how long to record (default 6)
 
@@ -62,6 +63,7 @@ struct Opts {
     rate: Option<u32>,
     chunk: usize,
     secs: f32,
+    probe: Option<render::TraceProbe>,
     input_on: bool,
     help: bool,
 }
@@ -77,6 +79,7 @@ impl Opts {
             rate: None,
             chunk: 256,
             secs: 6.0,
+            probe: None,
             input_on: false,
             help: false,
         };
@@ -118,6 +121,15 @@ impl Opts {
                         .map_err(|_| "--chunk needs a number")?;
                     o.chunk = v;
                 }
+                "--probe" => {
+                    o.probe = Some(match take(&mut it, "--probe")?.as_str() {
+                        "sine" => render::TraceProbe::Sine,
+                        "tail" => render::TraceProbe::Tail,
+                        other => {
+                            return Err(format!("unknown trace probe {other:?} (use sine or tail)"))
+                        }
+                    });
+                }
                 "-h" | "--help" | "help" => o.help = true,
                 s if s.starts_with('-') => return Err(format!("unknown option {s}")),
                 s => o.rest.push(s.to_string()),
@@ -142,7 +154,11 @@ fn run(args: &[String]) -> Result<u8, String> {
         print!("{HELP}");
         return Ok(0);
     }
-    match o.rest.first().map(String::as_str).unwrap_or("ui") {
+    let command = o.rest.first().map(String::as_str).unwrap_or("ui");
+    if o.probe.is_some() && command != "trace" {
+        return Err("--probe is only valid with trace".into());
+    }
+    match command {
         "ui" => {
             let preset = preset_for(&o)?;
             triode::ui::App::launch(preset, o.req())?;
@@ -216,26 +232,55 @@ fn run(args: &[String]) -> Result<u8, String> {
         }
         "trace" => {
             let input = o.rest.get(1).map(Path::new);
+            if input.is_some() && o.probe.is_some() {
+                return Err("trace cannot combine IN.wav with --probe".into());
+            }
             let dir = PathBuf::from("target/trace");
-            let (sr, stages) = render::trace(input, &preset_for(&o)?, o.chunk, o.rate, Some(&dir))?;
+            let (sr, stages) = render::trace_with_probe(
+                input,
+                &preset_for(&o)?,
+                o.chunk,
+                o.rate,
+                Some(&dir),
+                o.probe.unwrap_or_default(),
+            )?;
             println!(
-                "{:<12} {:>8} {:>8} {:>10} {:>8}",
-                "stage", "peak", "rms", "dc", "thd"
+                "{:<12} {:>8} {:>8} {:>8} {:>10} {:>10} {:>9} {:>8}  issue",
+                "stage", "peak", "rms", "ΔdB", "dc L", "dc R", "tail dB", "thd"
             );
+            let mut previous_rms: Option<f32> = None;
             for st in &stages {
+                let delta =
+                    previous_rms.map(|rms| 20.0 * (st.rms / rms.max(f32::MIN_POSITIVE)).log10());
+                let tail = st
+                    .tail_decay_db
+                    .map_or_else(|| "-".into(), |db| format!("{db:.1}"));
+                let mut issues = Vec::new();
+                if st.non_finite {
+                    issues.push("NON-FINITE");
+                }
+                if st.quiet() {
+                    issues.push("NO SIGNAL");
+                }
+                if st.tail_stalled() {
+                    issues.push("TAIL NOT DECAYING");
+                }
                 println!(
-                    "{:<12} {:>8.4} {:>8.4} {:>+10.2e} {:>8.3}{}",
+                    "{:<12} {:>8.4} {:>8.4} {:>8} {:>+10.2e} {:>+10.2e} {:>9} {:>8.3}  {}",
                     st.name,
                     st.peak,
                     st.rms,
+                    delta.map_or_else(|| "-".into(), |db| format!("{db:+.1}")),
                     st.dc,
+                    st.dc_right,
+                    tail,
                     st.thd,
-                    if st.quiet() { "   <- NO SIGNAL" } else { "" }
+                    issues.join(", ")
                 );
+                previous_rms = Some(st.rms);
             }
             println!("\n{} Hz · stage WAVs in {}", sr, dir.display());
-            // A dead stage is the thing worth failing a script on.
-            Ok(if stages.iter().any(|s| s.quiet()) {
+            Ok(if stages.iter().any(render::StageReport::failed) {
                 1
             } else {
                 0
@@ -331,6 +376,38 @@ mod tests {
             let opts = Opts::parse(&["--preset".into(), name.into()]).unwrap();
             assert_eq!(preset_for(&opts).unwrap().name, name);
         }
+    }
+
+    #[test]
+    fn trace_probe_parses_and_rejects_unknown_names() {
+        let tail = Opts::parse(&["trace".into(), "--probe".into(), "tail".into()]).unwrap();
+        assert_eq!(tail.probe, Some(render::TraceProbe::Tail));
+        assert!(Opts::parse(&["trace".into(), "--probe".into(), "noise".into()]).is_err());
+    }
+
+    #[test]
+    fn non_trace_commands_reject_probe() {
+        let err = run(&[
+            "render".into(),
+            "in.wav".into(),
+            "out.wav".into(),
+            "--probe".into(),
+            "tail".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("only valid with trace"));
+    }
+
+    #[test]
+    fn trace_rejects_a_wav_with_an_explicit_probe() {
+        let err = run(&[
+            "trace".into(),
+            "input.wav".into(),
+            "--probe".into(),
+            "tail".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("cannot combine"));
     }
 
     #[test]

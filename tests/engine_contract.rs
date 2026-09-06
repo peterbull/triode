@@ -120,6 +120,48 @@ fn every_effect_reconfigures_and_processes_without_heap() {
 }
 
 #[test]
+fn long_latency_effects_process_warmed_audio_without_heap() {
+    use triode::engine::Slot;
+    use triode::params::EffectKind;
+
+    for (kind, settings) in [
+        (EffectKind::ReverseDelay, [40.0, 0.0, 1.0]),
+        (EffectKind::PitchShifter, [12.0, 1.0, 1.0]),
+    ] {
+        // Slot::build exercises the make_proc factory path.
+        let mut slot = Slot::build(kind, true, 8_000.0);
+        let mut values = kind.default_values();
+        values.v[..3].copy_from_slice(&settings);
+        let mut warmup = vec![[0.0f32; 2]; 1_024];
+        for (index, frame) in warmup.iter_mut().enumerate() {
+            let sample = (index as f32 * 0.071).sin() * 0.2;
+            *frame = [sample, -sample];
+        }
+        let warmup_len = warmup.len();
+        slot.proc.process(&mut warmup, warmup_len, &values);
+
+        let input = [[0.1f32, -0.1]; 128];
+        let mut active = input;
+        no_heap(|| slot.proc.process(&mut active, 128, &values));
+        assert!(
+            active.iter().flatten().all(|sample| sample.is_finite()),
+            "{kind:?} produced non-finite warmed output"
+        );
+        let max_delta = active
+            .iter()
+            .zip(input)
+            .flat_map(|(output, input)| {
+                output
+                    .iter()
+                    .zip(input)
+                    .map(|(output, input)| (output - input).abs())
+            })
+            .fold(0.0f32, f32::max);
+        assert!(max_delta > 0.01, "{kind:?} factory was effectively a no-op");
+    }
+}
+
+#[test]
 fn structural_edits_prepare_and_retire_memory_off_callback() {
     use triode::dsp::cab::Ir;
     use triode::engine::{Cmd, Slot};

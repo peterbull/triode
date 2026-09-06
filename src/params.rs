@@ -164,6 +164,8 @@ pub enum EffectKind {
     Delay,
     AnalogDelay,
     Reverb,
+    ReverseDelay,
+    PitchShifter,
 }
 
 #[derive(Clone, Copy)]
@@ -184,7 +186,7 @@ impl EffectMeta {
 }
 
 impl EffectKind {
-    pub const ALL: [EffectKind; 17] = [
+    pub const ALL: [EffectKind; 19] = [
         EffectKind::Gate,
         EffectKind::Compressor,
         EffectKind::Boost,
@@ -202,6 +204,8 @@ impl EffectKind {
         EffectKind::Delay,
         EffectKind::AnalogDelay,
         EffectKind::Reverb,
+        EffectKind::ReverseDelay,
+        EffectKind::PitchShifter,
     ];
 
     const fn meta(self) -> EffectMeta {
@@ -225,6 +229,8 @@ impl EffectKind {
             EffectKind::Delay => EffectMeta::new("Delay", "DLY", &DELAY),
             EffectKind::AnalogDelay => EffectMeta::new("Analog Delay", "ANLG", &ANALOG_DELAY),
             EffectKind::Reverb => EffectMeta::new("Reverb", "RVB", &REVERB),
+            EffectKind::ReverseDelay => EffectMeta::new("Reverse Delay", "REV", &REVERSE_DELAY),
+            EffectKind::PitchShifter => EffectMeta::new("Pitch Shifter", "PITCH", &PITCH_SHIFTER),
         }
     }
 
@@ -385,6 +391,18 @@ const REVERB: [ParamSpec; 4] = [
     ParamSpec::lin("decay", 0.0, 1.0, 0.6, "", 2),
     ParamSpec::lin("mix", 0.0, 1.0, 0.3, "", 2),
     ParamSpec::lin("damp", 0.0, 1.0, 0.4, "", 2),
+];
+
+const REVERSE_DELAY: [ParamSpec; 3] = [
+    ParamSpec::log("window", 40.0, 2000.0, 500.0, "ms", 0),
+    ParamSpec::exp("feedback", 0.0, 0.85, 0.25, "", 2),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+];
+
+const PITCH_SHIFTER: [ParamSpec; 3] = [
+    ParamSpec::lin("interval", -12.0, 12.0, 12.0, "st", 1),
+    ParamSpec::lin("bend", 0.0, 1.0, 1.0, "", 2),
+    ParamSpec::lin("mix", 0.0, 1.0, 1.0, "", 2),
 ];
 
 /// Amplifier + global controls. Not rack slots: an amp always exists.
@@ -589,6 +607,18 @@ mod tests {
                 ANALOG_DELAY.as_slice(),
             ),
             (EffectKind::Reverb, "Reverb", "RVB", REVERB.as_slice()),
+            (
+                EffectKind::ReverseDelay,
+                "Reverse Delay",
+                "REV",
+                REVERSE_DELAY.as_slice(),
+            ),
+            (
+                EffectKind::PitchShifter,
+                "Pitch Shifter",
+                "PITCH",
+                PITCH_SHIFTER.as_slice(),
+            ),
         ];
         let mut names = std::collections::HashSet::new();
         let mut shorts = std::collections::HashSet::new();
@@ -605,8 +635,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_omar_parameter_contracts_are_literal_and_stable() {
-        let expected: [(EffectKind, &[ParamSpec]); 14] = [
+    fn existing_effect_parameter_contracts_are_literal_and_stable() {
+        let expected: [(EffectKind, &[ParamSpec]); 17] = [
             (
                 EffectKind::Gate,
                 &[
@@ -733,9 +763,68 @@ mod tests {
                     ParamSpec::lin("damp", 0.0, 1.0, 0.4, "", 2),
                 ],
             ),
+            (
+                EffectKind::StepFilter,
+                &[
+                    ParamSpec::log("frequency", 150.0, 3000.0, 800.0, "Hz", 0),
+                    ParamSpec::log("Q", 0.5, 4.0, 1.5, "", 2),
+                    ParamSpec::log("speed", 0.5, 16.0, 4.0, "Hz", 2),
+                    ParamSpec::lin("steps", 2.0, 9.0, 6.0, "", 0),
+                    ParamSpec::lin("random", 0.0, 1.0, 0.0, "", 0),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.7, "", 2),
+                ],
+            ),
+            (
+                EffectKind::RingModulator,
+                &[
+                    ParamSpec::log("carrier", 20.0, 2000.0, 120.0, "Hz", 1),
+                    ParamSpec::log("tone", 500.0, 16000.0, 8000.0, "Hz", 0),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                    ParamSpec::lin("level", -18.0, 6.0, -3.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::AnalogDelay,
+                &[
+                    ParamSpec::log("time", 20.0, 600.0, 350.0, "ms", 0),
+                    ParamSpec::exp("feedback", 0.0, 0.9, 0.45, "", 2),
+                    ParamSpec::log("tone", 500.0, 8000.0, 3500.0, "Hz", 0),
+                    ParamSpec::log("rate", 0.05, 8.0, 0.6, "Hz", 2),
+                    ParamSpec::exp("depth", 0.0, 1.0, 0.35, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.35, "", 2),
+                ],
+            ),
         ];
 
         for (kind, contract) in expected {
+            assert_eq!(
+                kind.params(),
+                contract,
+                "{kind:?} parameter contract changed"
+            );
+        }
+    }
+
+    #[test]
+    fn new_effect_parameter_contracts_are_literal_and_stable() {
+        for (kind, contract) in [
+            (
+                EffectKind::ReverseDelay,
+                &[
+                    ParamSpec::log("window", 40.0, 2000.0, 500.0, "ms", 0),
+                    ParamSpec::exp("feedback", 0.0, 0.85, 0.25, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                ][..],
+            ),
+            (
+                EffectKind::PitchShifter,
+                &[
+                    ParamSpec::lin("interval", -12.0, 12.0, 12.0, "st", 1),
+                    ParamSpec::lin("bend", 0.0, 1.0, 1.0, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 1.0, "", 2),
+                ][..],
+            ),
+        ] {
             assert_eq!(
                 kind.params(),
                 contract,

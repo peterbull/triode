@@ -468,7 +468,24 @@ fn open(
     })
 }
 
-/// Downmix the device's frames to mono f32 and push them into the ring.
+/// Use the first two physical inputs and ignore extra interface loopback channels.
+fn physical_input_mono<T>(frame: &[T]) -> f32
+where
+    T: Sample + Copy,
+    f32: FromSample<T>,
+{
+    let channels = frame.len().min(2);
+    if channels == 0 {
+        return 0.0;
+    }
+    frame[..channels]
+        .iter()
+        .map(|sample| f32::from_sample(*sample))
+        .sum::<f32>()
+        / channels as f32
+}
+
+/// Downmix the device's first two physical inputs to mono and push them into the ring.
 ///
 /// Pushing happens once per 256 frames rather than per sample, because each `push` is an
 /// atomic store on the write cursor and one per sample is pure waste.
@@ -486,11 +503,7 @@ macro_rules! in_arm {
                 while src + ch <= data.len() {
                     let mut k = 0usize;
                     while k < buf.len() && src + ch <= data.len() {
-                        let mut acc = 0.0f32;
-                        for sample in &data[src..src + ch] {
-                            acc += f32::from_sample(*sample);
-                        }
-                        buf[k] = acc / ch as f32;
+                        buf[k] = physical_input_mono(&data[src..src + ch]);
                         k += 1;
                         src += ch;
                     }
@@ -708,7 +721,7 @@ fn build_output_with_fallback(
 }
 
 /// One sample-format instantiation of the capture callback. Mono downmix, same rule as the
-/// live input: average the channels, because a guitar is mono.
+/// live input: use the first two physical channels and ignore interface loopback channels.
 macro_rules! cap_arm {
     ($t:ty, $dev:expr, $cfg:expr, $sink:expr, $failed:expr) => {{
         let sink: Arc<Mutex<Vec<f32>>> = $sink;
@@ -720,11 +733,7 @@ macro_rules! cap_arm {
                 if let Ok(mut buf) = sink.lock() {
                     let mut i = 0usize;
                     while i + ch <= data.len() && buf.len() < buf.capacity() {
-                        let mut acc = 0.0f32;
-                        for s in &data[i..i + ch] {
-                            acc += f32::from_sample(*s);
-                        }
-                        buf.push(acc / ch as f32);
+                        buf.push(physical_input_mono(&data[i..i + ch]));
                         i += ch;
                     }
                 }
@@ -830,6 +839,12 @@ fn finish_capture(
 mod tests {
     use super::*;
     use crate::engine::{Engine, ReopenReq, Shared};
+
+    #[test]
+    fn multichannel_interfaces_do_not_mix_loopback_channels_into_input() {
+        let scarlett = [0.2f32, 0.4, 1.0, -1.0];
+        assert!((physical_input_mono(&scarlett) - 0.3).abs() < 1e-6);
+    }
 
     #[test]
     fn requested_buffers_are_rate_scaled_clamped_and_have_a_default_fallback() {
