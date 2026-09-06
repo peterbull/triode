@@ -5,8 +5,6 @@ preamp + passive tone stack → phase inverter → long-tail-pair power amp → 
 simulation → brickwall limiter → out. Desktop UI with knobs, bypass switches and a live
 rack you can edit while playing.
 
-`docs/SPEC.md` holds the DSP maths, the real-time rules, and the decisions worth arguing
-about — including two deviations flagged for ratification.
 
 ## Run it
 
@@ -25,17 +23,6 @@ not just the fact that something did. Every stage is also written as its own WAV
 fuzz stage can be soloed instead of inferred. `capture` makes a real performance test input.
 
 Needs a Rust toolchain (<https://rustup.rs>). No build step, no assets, no server.
-
-**It starts with the input disarmed**, on purpose: laptop speakers a few centimetres from the
-laptop's own microphone plus an amp is a howl before you have touched anything. Open the window
-and you get a live amp with nothing captured; tick **`input on`** in the header to hear the guitar
-(or start with `--input-on`, or `--input "Device Name"`, which arms it too). If you are on an
-interface and headphones, there is nothing to howl — arm it and leave it armed.
-
-**Turn your monitor down first.** A live mic through speakers will howl; master starts at
-0.3 and there is a `mute` box in the amp card. On macOS, a binary launched from a terminal
-inherits that terminal's Microphone permission — if it was never granted you get silence,
-not an error (the header bar shows a climbing input-gap figure rather than a crash).
 
 ## The UI
 
