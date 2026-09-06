@@ -296,6 +296,92 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_kind_round_trips_without_rack_truncation() {
+        for kind in EffectKind::ALL {
+            let params: Vec<f32> = kind
+                .params()
+                .iter()
+                .enumerate()
+                .map(|(index, _)| (index as f32 + 1.0) / 10.0)
+                .collect();
+            let preset = Preset {
+                name: kind.name().into(),
+                slots: vec![SlotPreset {
+                    kind,
+                    enabled: false,
+                    params: params.clone(),
+                }],
+                ..Preset::empty()
+            };
+            let decoded = Preset::from_json(&preset.to_json()).expect("effect round trip");
+            assert_eq!(decoded.slots.len(), 1, "{kind:?}");
+            assert_eq!(decoded.slots[0].kind, kind);
+            assert!(!decoded.slots[0].enabled);
+            assert_eq!(decoded.slots[0].params, params);
+        }
+    }
+
+    #[test]
+    fn pre_omar_effect_names_are_stable_json_contracts() {
+        for (kind, spelling) in [
+            (EffectKind::Gate, "\"Gate\""),
+            (EffectKind::Compressor, "\"Compressor\""),
+            (EffectKind::Boost, "\"Boost\""),
+            (EffectKind::Overdrive, "\"Overdrive\""),
+            (EffectKind::Fuzz, "\"Fuzz\""),
+            (EffectKind::ParametricEq, "\"ParametricEq\""),
+            (EffectKind::EnvelopeFilter, "\"EnvelopeFilter\""),
+            (EffectKind::Tremolo, "\"Tremolo\""),
+            (EffectKind::Phaser, "\"Phaser\""),
+            (EffectKind::Flanger, "\"Flanger\""),
+            (EffectKind::Chorus, "\"Chorus\""),
+            (EffectKind::BitCrusher, "\"BitCrusher\""),
+            (EffectKind::Delay, "\"Delay\""),
+            (EffectKind::Reverb, "\"Reverb\""),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, spelling);
+            assert_eq!(serde_json::from_str::<EffectKind>(&json).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn new_effect_names_are_stable_json_contracts() {
+        for (kind, spelling) in [
+            (EffectKind::StepFilter, "\"StepFilter\""),
+            (EffectKind::RingModulator, "\"RingModulator\""),
+            (EffectKind::AnalogDelay, "\"AnalogDelay\""),
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, spelling);
+            assert_eq!(serde_json::from_str::<EffectKind>(&json).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn legacy_effect_names_and_values_keep_their_meaning() {
+        let json = r#"{"name":"legacy","slots":[{"kind":"Gate","enabled":false,"params":[0.25,0.75]},{"kind":"Overdrive","params":[0.1,0.2,0.3]},{"kind":"Delay","params":[0.4,0.5,0.6,0.7]},{"kind":"Reverb","params":[0.8,0.7,0.6,0.5]}],"amp":[0.1,0.2,0.3,0.4,0.5,0.6,0.7],"cab":true,"hpf":true}"#;
+        let preset = Preset::from_json(json).expect("legacy preset");
+        assert_eq!(
+            preset
+                .slots
+                .iter()
+                .map(|slot| slot.kind)
+                .collect::<Vec<_>>(),
+            [
+                EffectKind::Gate,
+                EffectKind::Overdrive,
+                EffectKind::Delay,
+                EffectKind::Reverb,
+            ]
+        );
+        assert_eq!(preset.slots[0].params, [0.25, 0.75]);
+        assert_eq!(preset.slots[2].params, [0.4, 0.5, 0.6, 0.7]);
+        assert_eq!(preset.amp, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]);
+        assert!(preset.cab && preset.hpf);
+    }
+
+    #[test]
     fn slots_are_built_with_their_knobs_not_defaults() {
         let p = Preset::blues();
         let slots = p.to_slots(48000.0);
@@ -353,18 +439,29 @@ mod tests {
 
     #[test]
     fn missing_knobs_and_slots_fall_back_to_defaults() {
+        for kind in EffectKind::ALL {
+            let kind_json = serde_json::to_string(&kind).unwrap();
+            let text = format!(r#"{{"slots":[{{"kind":{kind_json},"params":[]}}]}}"#);
+            let slots = Preset::from_json(&text).unwrap().to_slots(48_000.0);
+            let defaults = kind.default_norms();
+            assert_eq!(slots.len(), 1, "{kind:?}");
+            assert_eq!(
+                &slots[0].target.v[..kind.params().len()],
+                &defaults.v[..kind.params().len()],
+                "{kind:?} missing parameters did not use defaults"
+            );
+        }
+
         // Written against an older version of the effect: fewer knobs than it now has.
         let short = r#"{"name":"old","slots":[{"kind":"Delay","params":[0.4]}]}"#;
-        let p = Preset::from_json(short).unwrap();
-        let slots = p.to_slots(48000.0);
-        assert_eq!(slots.len(), 1);
-        let specs = EffectKind::Delay.params();
-        for (i, spec) in specs.iter().enumerate().skip(1) {
+        let slots = Preset::from_json(short).unwrap().to_slots(48_000.0);
+        for (i, spec) in EffectKind::Delay.params().iter().enumerate().skip(1) {
             assert!(
                 (slots[0].target.v[i] - spec.default_norm()).abs() < 1e-6,
                 "knob {i} not defaulted"
             );
         }
+
         // An empty rack is legal.
         assert!(Preset::from_json("{}").unwrap().slots.is_empty());
     }

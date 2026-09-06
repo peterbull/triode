@@ -99,6 +99,27 @@ fn source_replacement_does_not_replay_the_old_input() {
 }
 
 #[test]
+fn every_effect_reconfigures_and_processes_without_heap() {
+    use triode::engine::Slot;
+    for kind in triode::params::EffectKind::ALL {
+        let mut slot = Slot::build(kind, true, 44_100.0);
+        let values = kind.default_values();
+        let mut buffer = [[0.1f32, -0.1]; 128];
+        no_heap(|| {
+            slot.proc.process(&mut buffer, 128, &values);
+            slot.proc.set_rates(192_000.0);
+            slot.proc.process(&mut buffer, 128, &values);
+            slot.proc.reset();
+            slot.proc.process(&mut buffer, 128, &values);
+        });
+        assert!(
+            buffer.iter().flatten().all(|sample| sample.is_finite()),
+            "{kind:?} produced non-finite output"
+        );
+    }
+}
+
+#[test]
 fn structural_edits_prepare_and_retire_memory_off_callback() {
     use triode::dsp::cab::Ir;
     use triode::engine::{Cmd, Slot};
@@ -117,12 +138,17 @@ fn structural_edits_prepare_and_retire_memory_off_callback() {
     for kind in EffectKind::ALL {
         shared.send(Cmd::InsertSlot {
             at: 0,
-            slot: Slot::build(kind, true, 48000.0),
+            slot: Slot::build(kind, true, 44100.0),
+        });
+        shared.send(Cmd::SetParam {
+            slot: 0,
+            idx: 0,
+            norm: 0.73,
         });
         tick();
         shared.send(Cmd::ReplaceSlot {
             slot: 0,
-            with: Slot::build(kind, true, 48000.0),
+            with: Slot::build(kind, true, 96000.0),
         });
         tick();
         shared.send(Cmd::RemoveSlot { slot: 0 });

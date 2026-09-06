@@ -37,7 +37,7 @@ impl DelayLine {
 
     #[inline]
     pub fn write(&mut self, x: f32) {
-        self.buf[self.w & self.mask] = x;
+        self.buf[self.w & self.mask] = crate::dsp::flush_denormal(x);
         self.w = self.w.wrapping_add(1);
     }
 
@@ -124,6 +124,13 @@ mod tests {
             worst = worst.max((got - want).abs());
         }
         assert!(worst < 1e-6, "wrap-around error {worst}");
+    }
+
+    #[test]
+    fn writes_flush_subnormal_samples() {
+        let mut delay = DelayLine::new(8);
+        delay.write(f32::from_bits(1));
+        assert_eq!(delay.read(1.0), 0.0);
     }
 
     #[test]

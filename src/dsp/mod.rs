@@ -14,6 +14,7 @@ pub mod limiter;
 pub mod meter;
 pub mod resampler;
 pub mod ring;
+mod svf;
 
 /// One stereo sample.
 pub type Frame = [f32; 2];
@@ -21,6 +22,9 @@ pub type Frame = [f32; 2];
 /// Largest block the engine processes at a time. Fixed so the scratch buffer is
 /// stack/embedded and a device of any buffer size can be served by chunking.
 pub const MAX_CHUNK: usize = 512;
+
+/// Highest device rate supported by preallocated DSP state.
+pub(crate) const MAX_SAMPLE_RATE_HZ: f32 = 192_000.0;
 
 #[inline]
 pub fn db2lin(db: f32) -> f32 {
@@ -40,6 +44,16 @@ pub fn sanitize(x: f32, fallback: f32, min: f32, max: f32) -> f32 {
         x.clamp(min, max)
     } else {
         fallback
+    }
+}
+
+/// Flush finite subnormal state before it can make a real-time recurrence expensive.
+#[inline]
+pub(crate) fn flush_denormal(x: f32) -> f32 {
+    if x != 0.0 && x.abs() < f32::MIN_POSITIVE {
+        0.0
+    } else {
+        x
     }
 }
 

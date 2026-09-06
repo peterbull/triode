@@ -1,15 +1,23 @@
-//! Stompbox effects. Each is a [`crate::engine::Proc`]: no allocation, locking or
-//! blocking inside `process`, and all parameter indexes match the tables in
-//! [`crate::params`] exactly (a test asserts the counts so a spec edit cannot silently
-//! desync an effect).
+//! Seventeen stompbox effects. Each is a [`crate::engine::Proc`]: no allocation,
+//! locking or blocking inside `process`, and all parameter indexes match the tables
+//! in [`crate::params`] exactly (a test asserts the counts so a spec edit cannot
+//! silently desync an effect).
 
+pub mod analog_delay;
+pub mod bitcrusher;
 pub mod boost;
 pub mod chorus;
 pub mod comp;
 pub mod delay;
 pub mod drive;
+pub mod envelope_filter;
+pub mod eq;
+pub mod flanger;
 pub mod gate;
+pub mod phaser;
 pub mod reverb;
+pub mod ring_mod;
+pub mod step_filter;
 pub mod trem;
 
 #[cfg(test)]

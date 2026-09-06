@@ -3,7 +3,7 @@
 
 use crate::dsp::delayline::DelayLine;
 use crate::dsp::lfo::Lfo;
-use crate::dsp::{sanitize, Frame};
+use crate::dsp::{sanitize, Frame, MAX_SAMPLE_RATE_HZ};
 use crate::engine::Proc;
 use crate::params::ParamVals;
 
@@ -12,7 +12,7 @@ pub const DEPTH: usize = 1;
 pub const MIX: usize = 2;
 pub const BASE: usize = 3;
 
-/// Longest modulated delay (base 24 ms + full depth), sized for 96 kHz.
+/// Longest modulated delay (base 24 ms + full depth), sized for the highest rate.
 const MAX_MS: f32 = 40.0;
 
 pub struct Chorus {
@@ -31,11 +31,13 @@ impl Default for Chorus {
 
 impl Chorus {
     pub fn new() -> Chorus {
-        let cap = (MAX_MS * 96.0) as usize;
+        let cap = (MAX_MS * 0.001 * MAX_SAMPLE_RATE_HZ) as usize;
+        let mut lfo_r = Lfo::new();
+        lfo_r.set_phase(0.25);
         Chorus {
             sr: 48000.0,
             lfo_l: Lfo::new(),
-            lfo_r: Lfo::new(),
+            lfo_r,
             dl_l: DelayLine::new(cap),
             dl_r: DelayLine::new(cap),
         }
@@ -52,9 +54,9 @@ impl Chorus {
 
 impl Proc for Chorus {
     fn set_rates(&mut self, sr: f32) {
-        self.sr = sr.max(1.0);
+        self.sr = sanitize(sr, 48_000.0, 8_000.0, MAX_SAMPLE_RATE_HZ);
         // A quarter-cycle offset between channels is the whole stereo trick.
-        self.lfo_r.set_phase(0.25);
+        self.lfo_r.set_phase(self.lfo_l.phase() + 0.25);
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
@@ -88,7 +90,7 @@ impl Proc for Chorus {
         self.dl_l.reset();
         self.dl_r.reset();
         self.lfo_l.reset();
-        self.lfo_r.reset();
+        self.lfo_r.set_phase(0.25);
     }
 }
 
@@ -166,6 +168,59 @@ mod tests {
             diff > 1e-3,
             "chorus is not stereo, max L-R difference {diff}"
         );
+    }
+
+    #[test]
+    fn full_depth_modulation_fits_at_192khz() {
+        let c = Chorus::new();
+        let base = 24.0 * 0.001 * MAX_SAMPLE_RATE_HZ;
+        let swing = (base * 0.8).min(0.008 * MAX_SAMPLE_RATE_HZ);
+        let max_tap = Chorus::tap(base, swing, 1.0);
+        assert!(
+            max_tap <= c.dl_l.capacity() as f32 - 2.0,
+            "192 kHz full-depth tap {max_tap} exceeds capacity {}",
+            c.dl_l.capacity()
+        );
+    }
+
+    #[test]
+    fn full_depth_modulates_stereo_at_192khz() {
+        let x = sine(48_000, 440.0, MAX_SAMPLE_RATE_HZ, 0.4);
+        let mut c = Chorus::new();
+        c.set_rates(MAX_SAMPLE_RATE_HZ);
+        let (l, r) = run_st(&mut c, &x, &params(4.0, 1.0, 1.0, 24.0));
+        let diff = l[8192..]
+            .iter()
+            .zip(&r[8192..])
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff > 1e-3, "192 kHz chorus is not modulating: {diff}");
+    }
+
+    #[test]
+    fn reset_and_rate_change_keep_the_quarter_cycle_stereo_offset() {
+        let mut chorus = Chorus::new();
+        chorus.set_rates(SR);
+        chorus.lfo_l.set_rate(5.0, SR);
+        chorus.lfo_r.set_rate(5.0, SR);
+        for _ in 0..1_000 {
+            chorus.lfo_l.sine();
+            chorus.lfo_r.sine();
+        }
+        chorus.set_rates(MAX_SAMPLE_RATE_HZ);
+        assert!((chorus.lfo_r.phase() - chorus.lfo_l.phase() - 0.25).abs() < 1e-6);
+        assert_eq!(chorus.sr, MAX_SAMPLE_RATE_HZ);
+
+        chorus.reset();
+        assert_eq!(chorus.lfo_l.phase(), 0.0);
+        assert_eq!(chorus.lfo_r.phase(), 0.25);
+    }
+
+    #[test]
+    fn sample_rate_is_clamped_to_the_allocated_ceiling() {
+        let mut chorus = Chorus::new();
+        chorus.set_rates(MAX_SAMPLE_RATE_HZ * 2.0);
+        assert_eq!(chorus.sr, MAX_SAMPLE_RATE_HZ);
     }
 
     #[test]

@@ -203,16 +203,15 @@ impl Biquad {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         // TDF-II: fewer round-trips of quantised state than direct form I.
-        let y = self.b0 * x + self.x1;
-        self.x1 = self.b1 * x - self.a1 * y + self.x2;
-        self.x2 = self.b2 * x - self.a2 * y;
-        self.y1 = y;
-        if y.is_finite() {
-            y
-        } else {
+        let y = crate::dsp::flush_denormal(self.b0 * x + self.x1);
+        if !y.is_finite() {
             self.reset();
-            0.0
+            return 0.0;
         }
+        self.x1 = crate::dsp::flush_denormal(self.b1 * x - self.a1 * y + self.x2);
+        self.x2 = crate::dsp::flush_denormal(self.b2 * x - self.a2 * y);
+        self.y1 = y;
+        y
     }
 
     /// |H(e^jw)| at `f` — used by tests to check coefficients analytically.
@@ -271,7 +270,7 @@ impl OnePole {
 
     #[inline]
     pub fn lowpass(&mut self, x: f32) -> f32 {
-        self.z = x * (1.0 - self.a) + self.z * self.a;
+        self.z = crate::dsp::flush_denormal(x * (1.0 - self.a) + self.z * self.a);
         self.z
     }
 
@@ -279,7 +278,7 @@ impl OnePole {
     #[inline]
     pub fn lowpass_prev(&mut self, x: f32) -> f32 {
         let prev = self.z;
-        self.z = x * (1.0 - self.a) + self.z * self.a;
+        self.z = crate::dsp::flush_denormal(x * (1.0 - self.a) + self.z * self.a);
         prev
     }
 
@@ -327,9 +326,9 @@ impl DcBlocker {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = x - self.x1 + self.r * self.y1;
-        self.x1 = x;
+        self.x1 = crate::dsp::flush_denormal(x);
         self.y1 = if y.is_finite() {
-            y
+            crate::dsp::flush_denormal(y)
         } else {
             self.reset();
             0.0
@@ -502,6 +501,38 @@ mod tests {
             bq_pass > in_peak * 0.8,
             "1 kHz should survive a 20 Hz blocker"
         );
+    }
+
+    #[test]
+    fn recursive_helpers_flush_subnormal_state() {
+        let mut one_pole = OnePole::new();
+        one_pole.set_hz(10.0, SR);
+        one_pole.lowpass(1.0);
+        for _ in 0..100_000 {
+            one_pole.lowpass(0.0);
+        }
+        assert_eq!(one_pole.state(), 0.0);
+
+        let mut blocker = DcBlocker::new();
+        blocker.set_hz(10.0, SR);
+        blocker.process(1.0);
+        for _ in 0..100_000 {
+            blocker.process(0.0);
+        }
+        assert_eq!(blocker.x1, 0.0);
+        assert_eq!(blocker.y1, 0.0);
+
+        blocker.process(f32::from_bits(1));
+        assert_eq!(blocker.x1, 0.0);
+
+        let mut biquad = Biquad::new(Coef::lowpass(1_000.0, 0.707, SR));
+        biquad.process(1.0);
+        for _ in 0..2_000 {
+            biquad.process(0.0);
+        }
+        assert_eq!(biquad.x1, 0.0);
+        assert_eq!(biquad.x2, 0.0);
+        assert_eq!(biquad.y1, 0.0);
     }
 
     #[test]

@@ -318,13 +318,13 @@ mod tests {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let producer = std::thread::spawn(move || {
-            let mut i = 0.0f32;
+            let mut i = 0usize;
             let mut dropped = 0usize;
-            while (i as usize) < N {
-                let chunk: Vec<f32> = (0..64).map(|k| i + k as f32).collect();
+            while i < N {
+                let chunk: Vec<f32> = (0..(N - i).min(64)).map(|k| (i + k) as f32).collect();
                 let w = p.push(&chunk);
                 dropped += chunk.len() - w;
-                i += w as f32;
+                i += w;
                 if w == 0 {
                     std::thread::yield_now();
                 }

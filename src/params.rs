@@ -24,7 +24,7 @@ pub enum Curve {
     Exp,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParamSpec {
     pub name: &'static str,
     pub min: f32,
@@ -152,66 +152,93 @@ pub enum EffectKind {
     Boost,
     Overdrive,
     Fuzz,
+    ParametricEq,
+    EnvelopeFilter,
+    StepFilter,
     Tremolo,
+    Phaser,
+    Flanger,
     Chorus,
+    RingModulator,
+    BitCrusher,
     Delay,
+    AnalogDelay,
     Reverb,
 }
 
+#[derive(Clone, Copy)]
+struct EffectMeta {
+    name: &'static str,
+    short: &'static str,
+    params: &'static [ParamSpec],
+}
+
+impl EffectMeta {
+    const fn new(name: &'static str, short: &'static str, params: &'static [ParamSpec]) -> Self {
+        Self {
+            name,
+            short,
+            params,
+        }
+    }
+}
+
 impl EffectKind {
-    pub const ALL: [EffectKind; 9] = [
+    pub const ALL: [EffectKind; 17] = [
         EffectKind::Gate,
         EffectKind::Compressor,
         EffectKind::Boost,
         EffectKind::Overdrive,
         EffectKind::Fuzz,
+        EffectKind::ParametricEq,
+        EffectKind::EnvelopeFilter,
+        EffectKind::StepFilter,
         EffectKind::Tremolo,
+        EffectKind::Phaser,
+        EffectKind::Flanger,
         EffectKind::Chorus,
+        EffectKind::RingModulator,
+        EffectKind::BitCrusher,
         EffectKind::Delay,
+        EffectKind::AnalogDelay,
         EffectKind::Reverb,
     ];
 
-    pub const fn name(self) -> &'static str {
+    const fn meta(self) -> EffectMeta {
         match self {
-            EffectKind::Gate => "Noise Gate",
-            EffectKind::Compressor => "Compressor",
-            EffectKind::Boost => "Boost",
-            EffectKind::Overdrive => "Overdrive",
-            EffectKind::Fuzz => "Fuzz",
-            EffectKind::Tremolo => "Tremolo",
-            EffectKind::Chorus => "Chorus",
-            EffectKind::Delay => "Delay",
-            EffectKind::Reverb => "Reverb",
+            EffectKind::Gate => EffectMeta::new("Noise Gate", "GATE", &GATE),
+            EffectKind::Compressor => EffectMeta::new("Compressor", "COMP", &COMPRESSOR),
+            EffectKind::Boost => EffectMeta::new("Boost", "BOOST", &BOOST),
+            EffectKind::Overdrive => EffectMeta::new("Overdrive", "OD", &OVERDRIVE),
+            EffectKind::Fuzz => EffectMeta::new("Fuzz", "FUZZ", &FUZZ),
+            EffectKind::ParametricEq => EffectMeta::new("Parametric EQ", "EQ", &PARAMETRIC_EQ),
+            EffectKind::EnvelopeFilter => {
+                EffectMeta::new("Envelope Filter", "ENV", &ENVELOPE_FILTER)
+            }
+            EffectKind::StepFilter => EffectMeta::new("Step Filter", "STEP", &STEP_FILTER),
+            EffectKind::Tremolo => EffectMeta::new("Tremolo", "TREM", &TREMOLO),
+            EffectKind::Phaser => EffectMeta::new("Phaser", "PHASE", &PHASER),
+            EffectKind::Flanger => EffectMeta::new("Flanger", "FLANGE", &FLANGER),
+            EffectKind::Chorus => EffectMeta::new("Chorus", "CHOR", &CHORUS),
+            EffectKind::RingModulator => EffectMeta::new("Ring Modulator", "RING", &RING_MODULATOR),
+            EffectKind::BitCrusher => EffectMeta::new("Bit Crusher", "BITS", &BIT_CRUSHER),
+            EffectKind::Delay => EffectMeta::new("Delay", "DLY", &DELAY),
+            EffectKind::AnalogDelay => EffectMeta::new("Analog Delay", "ANLG", &ANALOG_DELAY),
+            EffectKind::Reverb => EffectMeta::new("Reverb", "RVB", &REVERB),
         }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.meta().name
     }
 
     /// Short label for the pedal-card title bar.
     pub const fn short(self) -> &'static str {
-        match self {
-            EffectKind::Gate => "GATE",
-            EffectKind::Compressor => "COMP",
-            EffectKind::Boost => "BOOST",
-            EffectKind::Overdrive => "OD",
-            EffectKind::Fuzz => "FUZZ",
-            EffectKind::Tremolo => "TREM",
-            EffectKind::Chorus => "CHOR",
-            EffectKind::Delay => "DLY",
-            EffectKind::Reverb => "RVB",
-        }
+        self.meta().short
     }
 
     pub const fn params(self) -> &'static [ParamSpec] {
-        match self {
-            EffectKind::Gate => &GATE,
-            EffectKind::Compressor => &COMPRESSOR,
-            EffectKind::Boost => &BOOST,
-            EffectKind::Overdrive => &OVERDRIVE,
-            EffectKind::Fuzz => &FUZZ,
-            EffectKind::Tremolo => &TREMOLO,
-            EffectKind::Chorus => &CHORUS,
-            EffectKind::Delay => &DELAY,
-            EffectKind::Reverb => &REVERB,
-        }
+        self.meta().params
     }
 
     /// Default normalised params, index-aligned with [`ParamSpec`] order.
@@ -267,10 +294,52 @@ const FUZZ: [ParamSpec; 3] = [
     ParamSpec::lin("level", -30.0, 6.0, -14.0, "dB", 1),
 ];
 
+const PARAMETRIC_EQ: [ParamSpec; 6] = [
+    ParamSpec::lin("bass", -12.0, 12.0, 0.0, "dB", 1),
+    ParamSpec::lin("mid", -12.0, 12.0, 0.0, "dB", 1),
+    ParamSpec::log("frequency", 150.0, 3000.0, 800.0, "Hz", 0),
+    ParamSpec::log("Q", 0.3, 4.0, 0.9, "", 2),
+    ParamSpec::lin("treble", -12.0, 12.0, 0.0, "dB", 1),
+    ParamSpec::lin("level", -12.0, 12.0, 0.0, "dB", 1),
+];
+
+const ENVELOPE_FILTER: [ParamSpec; 6] = [
+    ParamSpec::lin("sensitivity", -24.0, 24.0, 0.0, "dB", 1),
+    ParamSpec::log("base", 150.0, 1000.0, 300.0, "Hz", 0),
+    ParamSpec::lin("sweep", 0.0, 3.0, 2.0, "oct", 1),
+    ParamSpec::log("Q", 0.5, 4.0, 1.5, "", 2),
+    ParamSpec::log("release", 30.0, 600.0, 180.0, "ms", 0),
+    ParamSpec::lin("mix", 0.0, 1.0, 1.0, "", 2),
+];
+
+const STEP_FILTER: [ParamSpec; 6] = [
+    ParamSpec::log("frequency", 150.0, 3000.0, 800.0, "Hz", 0),
+    ParamSpec::log("Q", 0.5, 4.0, 1.5, "", 2),
+    ParamSpec::log("speed", 0.5, 16.0, 4.0, "Hz", 2),
+    ParamSpec::lin("steps", 2.0, 9.0, 6.0, "", 0),
+    ParamSpec::lin("random", 0.0, 1.0, 0.0, "", 0),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.7, "", 2),
+];
+
 const TREMOLO: [ParamSpec; 3] = [
     ParamSpec::log("rate", 0.5, 22.0, 5.0, "Hz", 2),
     ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
     ParamSpec::lin("level", -12.0, 12.0, 0.0, "dB", 1),
+];
+
+const PHASER: [ParamSpec; 4] = [
+    ParamSpec::log("rate", 0.05, 8.0, 0.5, "Hz", 2),
+    ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
+    ParamSpec::lin("feedback", 0.0, 0.7, 0.2, "", 2),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+];
+
+const FLANGER: [ParamSpec; 5] = [
+    ParamSpec::log("rate", 0.05, 5.0, 0.25, "Hz", 2),
+    ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
+    ParamSpec::log("base", 0.5, 5.0, 2.0, "ms", 2),
+    ParamSpec::lin("feedback", -0.85, 0.85, 0.35, "", 2),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
 ];
 
 const CHORUS: [ParamSpec; 4] = [
@@ -280,11 +349,35 @@ const CHORUS: [ParamSpec; 4] = [
     ParamSpec::log("base", 2.0, 24.0, 8.0, "ms", 1),
 ];
 
+const RING_MODULATOR: [ParamSpec; 4] = [
+    ParamSpec::log("carrier", 20.0, 2000.0, 120.0, "Hz", 1),
+    ParamSpec::log("tone", 500.0, 16000.0, 8000.0, "Hz", 0),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+    ParamSpec::lin("level", -18.0, 6.0, -3.0, "dB", 1),
+];
+
+const BIT_CRUSHER: [ParamSpec; 5] = [
+    ParamSpec::lin("bits", 4.0, 16.0, 10.0, "", 0),
+    ParamSpec::exp("downsample", 1.0, 32.0, 4.0, "×", 0),
+    ParamSpec::lin("drive", -12.0, 24.0, 0.0, "dB", 1),
+    ParamSpec::log("tone", 500.0, 16000.0, 8000.0, "Hz", 0),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+];
+
 const DELAY: [ParamSpec; 4] = [
     ParamSpec::log("time", 20.0, 1500.0, 380.0, "ms", 0),
     ParamSpec::exp("feedback", 0.0, 1.0, 0.45, "", 2),
     ParamSpec::lin("mix", 0.0, 1.0, 0.35, "", 2),
     ParamSpec::log("tone", 300.0, 12000.0, 3400.0, "Hz", 0),
+];
+
+const ANALOG_DELAY: [ParamSpec; 6] = [
+    ParamSpec::log("time", 20.0, 600.0, 350.0, "ms", 0),
+    ParamSpec::exp("feedback", 0.0, 0.9, 0.45, "", 2),
+    ParamSpec::log("tone", 500.0, 8000.0, 3500.0, "Hz", 0),
+    ParamSpec::log("rate", 0.05, 8.0, 0.6, "Hz", 2),
+    ParamSpec::exp("depth", 0.0, 1.0, 0.35, "", 2),
+    ParamSpec::lin("mix", 0.0, 1.0, 0.35, "", 2),
 ];
 
 const REVERB: [ParamSpec; 4] = [
@@ -434,6 +527,221 @@ mod tests {
     #[test]
     fn spec_tables_are_sane() {
         assert_eq!(spec_problems(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn effect_metadata_is_unique_and_stable() {
+        let expected = [
+            (EffectKind::Gate, "Noise Gate", "GATE", GATE.as_slice()),
+            (
+                EffectKind::Compressor,
+                "Compressor",
+                "COMP",
+                COMPRESSOR.as_slice(),
+            ),
+            (EffectKind::Boost, "Boost", "BOOST", BOOST.as_slice()),
+            (
+                EffectKind::Overdrive,
+                "Overdrive",
+                "OD",
+                OVERDRIVE.as_slice(),
+            ),
+            (EffectKind::Fuzz, "Fuzz", "FUZZ", FUZZ.as_slice()),
+            (
+                EffectKind::ParametricEq,
+                "Parametric EQ",
+                "EQ",
+                PARAMETRIC_EQ.as_slice(),
+            ),
+            (
+                EffectKind::EnvelopeFilter,
+                "Envelope Filter",
+                "ENV",
+                ENVELOPE_FILTER.as_slice(),
+            ),
+            (
+                EffectKind::StepFilter,
+                "Step Filter",
+                "STEP",
+                STEP_FILTER.as_slice(),
+            ),
+            (EffectKind::Tremolo, "Tremolo", "TREM", TREMOLO.as_slice()),
+            (EffectKind::Phaser, "Phaser", "PHASE", PHASER.as_slice()),
+            (EffectKind::Flanger, "Flanger", "FLANGE", FLANGER.as_slice()),
+            (EffectKind::Chorus, "Chorus", "CHOR", CHORUS.as_slice()),
+            (
+                EffectKind::RingModulator,
+                "Ring Modulator",
+                "RING",
+                RING_MODULATOR.as_slice(),
+            ),
+            (
+                EffectKind::BitCrusher,
+                "Bit Crusher",
+                "BITS",
+                BIT_CRUSHER.as_slice(),
+            ),
+            (EffectKind::Delay, "Delay", "DLY", DELAY.as_slice()),
+            (
+                EffectKind::AnalogDelay,
+                "Analog Delay",
+                "ANLG",
+                ANALOG_DELAY.as_slice(),
+            ),
+            (EffectKind::Reverb, "Reverb", "RVB", REVERB.as_slice()),
+        ];
+        let mut names = std::collections::HashSet::new();
+        let mut shorts = std::collections::HashSet::new();
+
+        assert_eq!(EffectKind::ALL.len(), expected.len());
+        for (actual, (kind, name, short, params)) in EffectKind::ALL.iter().zip(expected) {
+            assert_eq!(*actual, kind, "effect catalog order changed");
+            assert_eq!(kind.name(), name);
+            assert_eq!(kind.short(), short);
+            assert_eq!(kind.params(), params);
+            assert!(names.insert(kind.name()));
+            assert!(shorts.insert(kind.short()));
+        }
+    }
+
+    #[test]
+    fn pre_omar_parameter_contracts_are_literal_and_stable() {
+        let expected: [(EffectKind, &[ParamSpec]); 14] = [
+            (
+                EffectKind::Gate,
+                &[
+                    ParamSpec::lin("threshold", -70.0, -6.0, -42.0, "dB", 1),
+                    ParamSpec::log("release", 20.0, 900.0, 160.0, "ms", 0),
+                ],
+            ),
+            (
+                EffectKind::Compressor,
+                &[
+                    ParamSpec::lin("threshold", -50.0, 0.0, -24.0, "dB", 1),
+                    ParamSpec::lin("ratio", 1.0, 12.0, 4.0, ":1", 1),
+                    ParamSpec::log("attack", 0.3, 60.0, 12.0, "ms", 1),
+                    ParamSpec::log("release", 20.0, 900.0, 220.0, "ms", 0),
+                    ParamSpec::lin("makeup", 0.0, 18.0, 6.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::Boost,
+                &[
+                    ParamSpec::lin("level", -12.0, 18.0, 6.0, "dB", 1),
+                    ParamSpec::lin("tilt", 0.0, 1.0, 0.5, "", 2),
+                ],
+            ),
+            (
+                EffectKind::Overdrive,
+                &[
+                    ParamSpec::exp("drive", 0.0, 1.0, 0.55, "", 2),
+                    ParamSpec::log("tone", 220.0, 9000.0, 3200.0, "Hz", 0),
+                    ParamSpec::lin("level", -24.0, 12.0, -8.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::Fuzz,
+                &[
+                    ParamSpec::exp("fuzz", 0.0, 1.0, 0.75, "", 2),
+                    ParamSpec::log("tone", 200.0, 8000.0, 2400.0, "Hz", 0),
+                    ParamSpec::lin("level", -30.0, 6.0, -14.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::ParametricEq,
+                &[
+                    ParamSpec::lin("bass", -12.0, 12.0, 0.0, "dB", 1),
+                    ParamSpec::lin("mid", -12.0, 12.0, 0.0, "dB", 1),
+                    ParamSpec::log("frequency", 150.0, 3000.0, 800.0, "Hz", 0),
+                    ParamSpec::log("Q", 0.3, 4.0, 0.9, "", 2),
+                    ParamSpec::lin("treble", -12.0, 12.0, 0.0, "dB", 1),
+                    ParamSpec::lin("level", -12.0, 12.0, 0.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::EnvelopeFilter,
+                &[
+                    ParamSpec::lin("sensitivity", -24.0, 24.0, 0.0, "dB", 1),
+                    ParamSpec::log("base", 150.0, 1000.0, 300.0, "Hz", 0),
+                    ParamSpec::lin("sweep", 0.0, 3.0, 2.0, "oct", 1),
+                    ParamSpec::log("Q", 0.5, 4.0, 1.5, "", 2),
+                    ParamSpec::log("release", 30.0, 600.0, 180.0, "ms", 0),
+                    ParamSpec::lin("mix", 0.0, 1.0, 1.0, "", 2),
+                ],
+            ),
+            (
+                EffectKind::Tremolo,
+                &[
+                    ParamSpec::log("rate", 0.5, 22.0, 5.0, "Hz", 2),
+                    ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
+                    ParamSpec::lin("level", -12.0, 12.0, 0.0, "dB", 1),
+                ],
+            ),
+            (
+                EffectKind::Phaser,
+                &[
+                    ParamSpec::log("rate", 0.05, 8.0, 0.5, "Hz", 2),
+                    ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
+                    ParamSpec::lin("feedback", 0.0, 0.7, 0.2, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                ],
+            ),
+            (
+                EffectKind::Flanger,
+                &[
+                    ParamSpec::log("rate", 0.05, 5.0, 0.25, "Hz", 2),
+                    ParamSpec::exp("depth", 0.0, 1.0, 0.7, "", 2),
+                    ParamSpec::log("base", 0.5, 5.0, 2.0, "ms", 2),
+                    ParamSpec::lin("feedback", -0.85, 0.85, 0.35, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                ],
+            ),
+            (
+                EffectKind::Chorus,
+                &[
+                    ParamSpec::log("rate", 0.05, 8.0, 0.8, "Hz", 2),
+                    ParamSpec::exp("depth", 0.0, 1.0, 0.5, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                    ParamSpec::log("base", 2.0, 24.0, 8.0, "ms", 1),
+                ],
+            ),
+            (
+                EffectKind::BitCrusher,
+                &[
+                    ParamSpec::lin("bits", 4.0, 16.0, 10.0, "", 0),
+                    ParamSpec::exp("downsample", 1.0, 32.0, 4.0, "×", 0),
+                    ParamSpec::lin("drive", -12.0, 24.0, 0.0, "dB", 1),
+                    ParamSpec::log("tone", 500.0, 16000.0, 8000.0, "Hz", 0),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.5, "", 2),
+                ],
+            ),
+            (
+                EffectKind::Delay,
+                &[
+                    ParamSpec::log("time", 20.0, 1500.0, 380.0, "ms", 0),
+                    ParamSpec::exp("feedback", 0.0, 1.0, 0.45, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.35, "", 2),
+                    ParamSpec::log("tone", 300.0, 12000.0, 3400.0, "Hz", 0),
+                ],
+            ),
+            (
+                EffectKind::Reverb,
+                &[
+                    ParamSpec::lin("size", 0.0, 1.0, 0.6, "", 2),
+                    ParamSpec::lin("decay", 0.0, 1.0, 0.6, "", 2),
+                    ParamSpec::lin("mix", 0.0, 1.0, 0.3, "", 2),
+                    ParamSpec::lin("damp", 0.0, 1.0, 0.4, "", 2),
+                ],
+            ),
+        ];
+
+        for (kind, contract) in expected {
+            assert_eq!(
+                kind.params(),
+                contract,
+                "{kind:?} parameter contract changed"
+            );
+        }
     }
 
     #[test]

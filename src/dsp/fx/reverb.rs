@@ -3,10 +3,11 @@
 //! per channel.
 //!
 //! Tunings are the canonical 44.1 kHz values scaled by `sr / 44100`, so the room sounds
-//! the same at 48 k and 96 k rather than a quarter-tone sharper. Buffers are allocated at
-//! construction for 96 kHz, so `set_rates` never allocates on the audio thread.
+//! the same at 48 k, 96 k and 192 k rather than a quarter-tone sharper. Buffers are
+//! allocated at construction for the highest supported rate, so `set_rates` never allocates
+//! on the audio thread.
 
-use crate::dsp::{sanitize, Frame};
+use crate::dsp::{sanitize, Frame, MAX_SAMPLE_RATE_HZ};
 use crate::engine::Proc;
 use crate::params::ParamVals;
 
@@ -19,8 +20,8 @@ const COMB_L: [usize; 4] = [1557, 1617, 1491, 1422];
 const COMB_R: [usize; 4] = [1687, 1601, 1277, 1356];
 const AP: [usize; 4] = [556, 441, 341, 225];
 const REF_SR: f32 = 44100.0;
-/// Buffers are sized for this much headroom over the reference rate (96 kHz).
-const MAX_SCALE: f32 = 96000.0 / REF_SR;
+/// Buffers are sized for the highest supported rate.
+const MAX_SCALE: f32 = MAX_SAMPLE_RATE_HZ / REF_SR;
 
 /// Input scale that keeps the comb loops well inside unity.
 const INPUT_GAIN: f32 = 0.015;
@@ -144,7 +145,7 @@ impl Default for Reverb {
 
 impl Proc for Reverb {
     fn set_rates(&mut self, sr: f32) {
-        self.sr = sr.max(8000.0);
+        self.sr = sanitize(sr, 48_000.0, 8_000.0, MAX_SAMPLE_RATE_HZ);
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
@@ -380,6 +381,30 @@ mod tests {
     }
 
     #[test]
+    fn high_rate_192khz_tunings_use_full_scale() {
+        let mut r = Reverb::new();
+        r.set_rates(MAX_SAMPLE_RATE_HZ);
+
+        let scale = (r.sr / REF_SR).clamp(0.25, MAX_SCALE);
+        assert!((scale - MAX_SAMPLE_RATE_HZ / REF_SR).abs() < 1e-6);
+        assert_eq!(
+            r.combs_l[0].len(scale, 1.0),
+            (COMB_L[0] as f32 * MAX_SAMPLE_RATE_HZ / REF_SR) as usize
+        );
+        assert_eq!(
+            r.ap_l[0].len(scale),
+            (AP[0] as f32 * MAX_SAMPLE_RATE_HZ / REF_SR) as usize
+        );
+    }
+
+    #[test]
+    fn sample_rate_is_clamped_to_the_allocated_ceiling() {
+        let mut reverb = Reverb::new();
+        reverb.set_rates(MAX_SAMPLE_RATE_HZ * 2.0);
+        assert_eq!(reverb.sr, MAX_SAMPLE_RATE_HZ);
+    }
+
+    #[test]
     fn runs_at_every_supported_rate_without_allocating_state_growth() {
         for sr in [44100.0f32, 48000.0, 88200.0, 96000.0] {
             let mut r = Reverb::new();
@@ -389,7 +414,7 @@ mod tests {
             assert!(l.iter().all(|s| s.is_finite()), "{sr} non-finite");
             assert!(peak(&l) < 1.5, "{sr} peak {}", peak(&l));
         }
-        // buffers were sized for 96 kHz at construction
+        // buffers were sized for the highest supported rate at construction
         assert!(footprint() > 0);
     }
 

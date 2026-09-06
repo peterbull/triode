@@ -7,7 +7,7 @@
 
 use crate::dsp::biquad::OnePole;
 use crate::dsp::delayline::DelayLine;
-use crate::dsp::{sanitize, Frame};
+use crate::dsp::{sanitize, Frame, MAX_SAMPLE_RATE_HZ};
 use crate::engine::Proc;
 use crate::params::ParamVals;
 
@@ -18,7 +18,6 @@ pub const TONE: usize = 3;
 
 /// Longest echo, and the tap for the right-hand line, which is 1.5× the left.
 const MAX_MS: f32 = 1600.0;
-const MAX_RATE: f32 = 96000.0;
 /// Stability ceiling — see the module comment for why this is not 0.65.
 const MAX_FEEDBACK: f32 = 0.92;
 
@@ -32,7 +31,7 @@ pub struct StereoDelay {
 
 impl StereoDelay {
     pub fn new() -> StereoDelay {
-        let cap = (MAX_MS * 0.001 * MAX_RATE * 1.6) as usize;
+        let cap = (MAX_MS * 0.001 * MAX_SAMPLE_RATE_HZ * 1.6) as usize;
         StereoDelay {
             sr: 48000.0,
             l: DelayLine::new(cap),
@@ -51,7 +50,7 @@ impl Default for StereoDelay {
 
 impl Proc for StereoDelay {
     fn set_rates(&mut self, sr: f32) {
-        self.sr = sr.max(1.0);
+        self.sr = sanitize(sr, 48_000.0, 8_000.0, MAX_SAMPLE_RATE_HZ);
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
@@ -151,6 +150,23 @@ mod tests {
     }
 
     #[test]
+    fn max_time_echo_lands_at_192khz() {
+        let want = (MAX_MS * 0.001 * MAX_SAMPLE_RATE_HZ) as usize;
+        let mut buf = vec![[0.0f32; 2]; want + 4];
+        buf[0] = [0.8, 0.8];
+
+        let mut d = StereoDelay::new();
+        d.set_rates(MAX_SAMPLE_RATE_HZ);
+        let n = buf.len();
+        d.process(&mut buf, n, &params(MAX_MS, 0.0, 1.0, 12000.0));
+
+        assert!(
+            buf[want - 2..want + 3].iter().any(|f| f[0].abs() > 0.5),
+            "no 1.6 second echo at 192 kHz"
+        );
+    }
+
+    #[test]
     fn feedback_repeats_and_the_right_side_is_later() {
         let time_ms = 100.0;
         let dt = (time_ms * 0.001 * SR) as usize;
@@ -244,6 +260,13 @@ mod tests {
         d.set_rates(8000.0);
         d.process(&mut buf, 256, &params(1500.0, 1.0, 1.0, 300.0));
         assert!(buf.iter().all(|f| f[0].is_finite()));
+    }
+
+    #[test]
+    fn sample_rate_is_clamped_to_the_allocated_ceiling() {
+        let mut delay = StereoDelay::new();
+        delay.set_rates(MAX_SAMPLE_RATE_HZ * 2.0);
+        assert_eq!(delay.sr, MAX_SAMPLE_RATE_HZ);
     }
 
     #[test]
