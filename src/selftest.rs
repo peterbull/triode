@@ -32,18 +32,18 @@ impl Check {
 
 /// Everything worth knowing before trusting the audio path.
 pub fn run() -> Vec<Check> {
-    let mut checks = Vec::new();
-    checks.push(signal_passes());
-    checks.push(dc_is_removed());
-    checks.push(ceiling_holds());
-    checks.push(effects_survive_every_knob());
-    checks.push(delay_echo_is_on_time());
-    checks.push(reverb_tail_decays());
-    checks.push(drive_adds_harmonics_without_aliasing());
-    checks.push(rates_44_48_96_all_work());
-    checks.push(preset_round_trips());
-    checks.push(wav_render_round_trips());
-    checks
+    vec![
+        signal_passes(),
+        dc_is_removed(),
+        ceiling_holds(),
+        effects_survive_every_knob(),
+        delay_echo_is_on_time(),
+        reverb_tail_decays(),
+        drive_adds_harmonics_without_aliasing(),
+        rates_44_48_96_all_work(),
+        preset_round_trips(),
+        wav_render_round_trips(),
+    ]
 }
 
 /// Print the report; returns false if anything failed (used for the exit code).

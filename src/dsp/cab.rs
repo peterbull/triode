@@ -40,9 +40,8 @@ impl Ir {
     /// Errors are descriptive because this is the
     /// one path a human gets wrong (wrong file, empty file, all zeros).
     pub fn new(name: String, mut samples: Vec<f32>) -> Result<Ir, String> {
-        samples.retain(|s| s.is_finite());
-        if samples.is_empty() {
-            return Err("IR is empty or contains only non-finite samples".to_string());
+        if samples.is_empty() || samples.iter().any(|s| !s.is_finite()) {
+            return Err("IR is empty or contains non-finite samples".to_string());
         }
         let l1 = samples.iter().fold(0.0f32, |m, s| m + s.abs());
         let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -65,7 +64,10 @@ impl Ir {
     pub fn from_wav(path: &str) -> Result<Ir, String> {
         let mut reader = hound::WavReader::open(path).map_err(|e| format!("{path}: {e}"))?;
         let spec = reader.spec();
-        let ch = spec.channels.max(1) as usize;
+        if spec.channels == 0 || !(1..=32).contains(&spec.bits_per_sample) {
+            return Err(format!("{path}: invalid channel count or bit depth"));
+        }
+        let ch = spec.channels as usize;
         let want = MAX_IR_TAPS.min(reader.duration() as usize).max(1);
         let mut out = Vec::with_capacity(want * ch);
         match spec.sample_format {
@@ -82,9 +84,7 @@ impl Ir {
                     }
                 } else {
                     for s in reader.samples::<i32>().take(want * ch) {
-                        out.push(
-                            s.map_err(|e| format!("{path}: {e}"))? as f32 / (1i64 << 31) as f32,
-                        );
+                        out.push(s.map_err(|e| format!("{path}: {e}"))? as f32 * scale);
                     }
                 }
             }
@@ -146,9 +146,9 @@ impl IrConv {
 
 pub struct Cab {
     sr: f32,
-    hp: Biquad,
-    lp: [Biquad; 2],
-    peak: Biquad,
+    hp: [Biquad; 2],
+    lp: [[Biquad; 2]; 2],
+    peak: [Biquad; 2],
     /// Level trim so switching between model and IR is not a loud surprise.
     trim: f32,
     conv: [Option<IrConv>; 2],
@@ -159,9 +159,9 @@ impl Cab {
     pub fn new(sr: f32) -> Cab {
         let mut c = Cab {
             sr,
-            hp: Biquad::passthrough(),
-            lp: [Biquad::passthrough(), Biquad::passthrough()],
-            peak: Biquad::passthrough(),
+            hp: [Biquad::passthrough(); 2],
+            lp: [[Biquad::passthrough(); 2]; 2],
+            peak: [Biquad::passthrough(); 2],
             trim: 0.85,
             conv: [None, None],
             ir_name: None,
@@ -174,10 +174,15 @@ impl Cab {
         self.sr = sr.max(8000.0);
         // 850 Hz top end with a 24 dB/oct slope is the "mic'd 4x12" sound; a raw amp
         // straight into a full-range speaker is exactly the harshness this removes.
-        self.hp.set(Coef::highpass(85.0, 0.707, self.sr));
-        self.lp[0].set(Coef::lowpass_bw(5200.0, self.sr));
-        self.lp[1].set(Coef::lowpass_bw(5200.0, self.sr));
-        self.peak.set(Coef::peaking(1100.0, 3.0, 1.2, self.sr));
+        let hp = Coef::highpass(85.0, 0.707, self.sr);
+        let lp = Coef::lowpass_bw(5200.0, self.sr);
+        let peak = Coef::peaking(1100.0, 3.0, 1.2, self.sr);
+        for channel in 0..2 {
+            self.hp[channel].set(hp);
+            self.lp[channel][0].set(lp);
+            self.lp[channel][1].set(lp);
+            self.peak[channel].set(peak);
+        }
     }
 
     pub fn sr(&self) -> f32 {
@@ -215,22 +220,23 @@ impl Cab {
             return;
         }
         for f in buf[..n].iter_mut() {
-            for (ci, ch) in f.iter_mut().enumerate().take(2) {
-                let mut x = self.hp.process(*ch);
-                x = self.lp[0].process(x);
-                x = self.lp[1].process(x);
-                x = self.peak.process(x);
-                *ch = x * self.trim;
-                let _ = ci;
+            for (channel, sample) in f.iter_mut().enumerate() {
+                let mut x = self.hp[channel].process(*sample);
+                x = self.lp[channel][0].process(x);
+                x = self.lp[channel][1].process(x);
+                x = self.peak[channel].process(x);
+                *sample = x * self.trim;
             }
         }
     }
 
     pub fn reset(&mut self) {
-        self.hp.reset();
-        self.lp[0].reset();
-        self.lp[1].reset();
-        self.peak.reset();
+        for channel in 0..2 {
+            self.hp[channel].reset();
+            self.lp[channel][0].reset();
+            self.lp[channel][1].reset();
+            self.peak[channel].reset();
+        }
     }
 }
 
@@ -249,6 +255,29 @@ mod tests {
         let y: Vec<f32> = buf.iter().skip(4096).map(|fr| fr[0]).collect();
         let src: Vec<f32> = x.iter().skip(4096).copied().collect();
         goertzel_mag(&y, f, SR) / goertzel_mag(&src, f, SR).max(1e-9)
+    }
+
+    #[test]
+    fn model_channels_have_independent_history() {
+        let x = sine(4096, 700.0, SR, 0.4);
+
+        let mut matching = Cab::new(SR);
+        let mut stereo: Vec<Frame> = x.iter().map(|s| [*s, *s]).collect();
+        let n = stereo.len();
+        matching.process(&mut stereo, n);
+        assert!(
+            stereo.iter().all(|f| (f[0] - f[1]).abs() < 1e-7),
+            "identical inputs must remain identical"
+        );
+
+        let mut isolated = Cab::new(SR);
+        let mut left_only: Vec<Frame> = x.iter().map(|s| [*s, 0.0]).collect();
+        let n = left_only.len();
+        isolated.process(&mut left_only, n);
+        assert!(
+            left_only.iter().all(|f| f[1].abs() < 1e-7),
+            "left input leaked into right output"
+        );
     }
 
     #[test]
@@ -275,7 +304,9 @@ mod tests {
         with.set_rates(SR);
         let at_peak = levels(&mut with, 1100.0);
         let mut no_peak = Cab::new(SR);
-        no_peak.peak.set(Coef::peaking(1100.0, 0.0, 1.2, SR));
+        for peak in no_peak.peak.iter_mut() {
+            peak.set(Coef::peaking(1100.0, 0.0, 1.2, SR));
+        }
         let without = levels(&mut no_peak, 1100.0);
         assert!(at_peak > without, "the 1.1 kHz peak should add presence");
         let _ = cab;
@@ -323,6 +354,7 @@ mod tests {
         assert!(Ir::new("empty".into(), vec![]).is_err());
         assert!(Ir::new("zeros".into(), vec![0.0; 100]).is_err());
         assert!(Ir::new("nans".into(), vec![f32::NAN; 50]).is_err());
+        assert!(Ir::new("mixed".into(), vec![1.0, f32::NAN, 0.5]).is_err());
         assert!(Ir::from_wav("/definitely/not/here.wav").is_err());
         // over-long IRs are truncated to the affordable length, not rejected silently
         let long = Ir::new("long".into(), vec![0.4; MAX_IR_TAPS * 3]).unwrap();

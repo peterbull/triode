@@ -1,7 +1,7 @@
 //! Triode — a real-time valve amp in Rust.
 //!
-//! Four commands, no subcommand library: `ui` (the default), `render` for offline WAV
-//! processing, `selftest` for the audio sanity sweep, `devices` to see what this machine has.
+//! Native UI plus offline render/trace/selftest, device capture, and a no-audio preview.
+//! No subcommand library: the command surface stays small and explicit.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,6 +19,7 @@ Triode — guitar amp + stompbox rack
   triode devices                list input and output devices
   triode render IN OUT.wav      offline render (no audio device needed)
   triode selftest               run the audio sanity checks and exit
+  triode preview OUT.ppm [W H]  capture the native UI without opening audio devices
   triode trace [IN.wav]         measure every stage boundary; writes per-stage WAVs
   triode capture OUT.wav        record the input device to a WAV to trace or render later
 
@@ -26,7 +27,7 @@ Triode — guitar amp + stompbox rack
 something and per-stage THD shows exactly which stage adds distortion.
 
 options
-  --preset <name|file.json>   named preset from ~/.triode, or a JSON file
+  --preset <name|file.json>   built-in/saved preset name, or a JSON file
   --buffer <ms>               requested audio buffer, 1..50 (default 5)
   --input  <name>             capture device (default: system default)
   --output <name>             playback device (default: system default)
@@ -35,7 +36,7 @@ options
   --input-on              arm the input at startup (default: output only, no howl)
   --seconds <n>               capture: how long to record (default 6)
 
-start with --preset demo (or no preset at all) and the test tone in the UI's
+start with --preset blues (or no preset at all) and the test tone in the UI's
 wave panel, if you have no guitar to hand.
 ";
 
@@ -106,6 +107,9 @@ impl Opts {
                     let v: f32 = take(&mut it, "--seconds")?
                         .parse()
                         .map_err(|_| "--seconds needs a number")?;
+                    if !v.is_finite() {
+                        return Err("--seconds needs a finite duration".into());
+                    }
                     o.secs = v.clamp(0.2, 600.0);
                 }
                 "--chunk" => {
@@ -142,6 +146,26 @@ fn run(args: &[String]) -> Result<u8, String> {
         "ui" => {
             let preset = preset_for(&o)?;
             triode::ui::App::launch(preset, o.req())?;
+            Ok(0)
+        }
+        "preview" => {
+            if o.rest.len() != 2 && o.rest.len() != 4 {
+                return Err("preview needs OUT.ppm and optional width height".into());
+            }
+            let mut size = [1180.0, 780.0];
+            if o.rest.len() == 4 {
+                for (i, value) in o.rest[2..].iter().enumerate() {
+                    let pixels: u16 = value
+                        .parse()
+                        .map_err(|_| "preview dimensions must be integers")?;
+                    let min = [880, 560][i];
+                    if !(min..=3840).contains(&pixels) {
+                        return Err(format!("preview dimension must be {min}..3840 pixels"));
+                    }
+                    size[i] = pixels as f32;
+                }
+            }
+            triode::ui::App::preview(preset_for(&o)?, PathBuf::from(&o.rest[1]), size)?;
             Ok(0)
         }
         "devices" => {
@@ -279,6 +303,12 @@ fn preset_for(o: &Opts) -> Result<Preset, String> {
             return Preset::load_from(&p);
         }
     }
+    // Explicit paths and saved patches win; built-ins always work on a fresh checkout.
+    match name.as_str() {
+        "blues" => return Ok(Preset::blues()),
+        "empty" => return Ok(Preset::empty()),
+        _ => {}
+    }
     let avail = Preset::list(&dir);
     Err(format!(
         "no preset {name:?} in {} (have: {})",
@@ -289,4 +319,24 @@ fn preset_for(o: &Opts) -> Result<Preset, String> {
             avail.join(", ")
         }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_presets_are_available_without_saved_files() {
+        for name in ["blues", "empty"] {
+            let opts = Opts::parse(&["--preset".into(), name.into()]).unwrap();
+            assert_eq!(preset_for(&opts).unwrap().name, name);
+        }
+    }
+
+    #[test]
+    fn capture_duration_must_be_finite() {
+        for value in ["NaN", "inf", "-inf"] {
+            assert!(Opts::parse(&["--seconds".into(), value.into()]).is_err());
+        }
+    }
 }

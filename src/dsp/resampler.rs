@@ -14,6 +14,10 @@ pub trait Source: Send {
     fn read(&mut self, dst: &mut [f32]) -> usize;
     /// Frames buffered and waiting (0 when the source has no queue).
     fn level(&self) -> usize;
+    /// Live asynchronous FIFO occupancy, not the remaining length of a file.
+    fn clock_level(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A source that just hands back a fixed slice, for `--render`.
@@ -166,7 +170,6 @@ impl Default for Resampler {
 mod tests {
     use super::*;
     use crate::dsp::analysis::{goertzel_mag, sine};
-    use crate::dsp::MAX_CHUNK;
 
     const SR: f32 = 48000.0;
 
@@ -282,6 +285,5 @@ mod tests {
         }
         r.reset();
         assert_eq!(r.next(&mut src), 0.0);
-        assert!(MAX_CHUNK > 0);
     }
 }

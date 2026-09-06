@@ -4,18 +4,39 @@
 //! trait or `Plot` -- those APIs churn between egui releases, while these two have been
 //! stable for years and give pixel-exact control, which a scope needs.
 
-use egui::{Align2, Color32, FontId, Layout, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2};
 
 use crate::params::ParamSpec;
 
 /// Knob footprint including its label and value readout.
 pub const KNOB: Vec2 = Vec2::new(58.0, 78.0);
 
-const TRACK: Color32 = Color32::from_gray(70);
-const TEXT: Color32 = Color32::from_gray(190);
-const DIM: Color32 = Color32::from_gray(130);
-const IN_COLOUR: Color32 = Color32::from_rgb(110, 190, 255);
-const OUT_COLOUR: Color32 = Color32::from_rgb(120, 230, 140);
+pub const CHARCOAL: Color32 = Color32::from_rgb(30, 29, 27);
+pub const PANEL: Color32 = Color32::from_rgb(43, 41, 37);
+pub const CREAM: Color32 = Color32::from_rgb(239, 229, 207);
+pub const AMBER: Color32 = Color32::from_rgb(222, 166, 78);
+pub const ERROR: Color32 = Color32::from_rgb(239, 113, 94);
+pub const SUCCESS: Color32 = Color32::from_rgb(133, 204, 137);
+pub const MUTED: Color32 = Color32::from_rgb(190, 181, 164);
+
+const TRACK: Color32 = Color32::from_rgb(92, 84, 72);
+const TEXT: Color32 = CREAM;
+const DIM: Color32 = MUTED;
+const IN_COLOUR: Color32 = Color32::from_rgb(118, 185, 205);
+const OUT_COLOUR: Color32 = SUCCESS;
+
+pub fn visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = CHARCOAL;
+    visuals.window_fill = PANEL;
+    visuals.override_text_color = Some(CREAM);
+    visuals.selection.bg_fill = AMBER.linear_multiply(0.45);
+    visuals.selection.stroke.color = AMBER;
+    visuals.widgets.inactive.bg_fill = PANEL;
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(65, 59, 49);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(83, 70, 47);
+    visuals
+}
 
 fn label_font() -> FontId {
     FontId::proportional(11.0)
@@ -49,8 +70,8 @@ pub fn knob(ui: &mut Ui, label: &str, spec: &ParamSpec, u: &mut f32) -> Response
         changed = true;
     }
     if resp.contains_pointer() {
-        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
-        if wheel != 0.0 {
+        let (wheel, intentional) = ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.alt));
+        if intentional && wheel != 0.0 {
             *u = (*u + wheel / 600.0).clamp(0.0, 1.0);
             changed = true;
         }
@@ -85,8 +106,15 @@ pub fn knob(ui: &mut Ui, label: &str, spec: &ParamSpec, u: &mut f32) -> Response
     }
 
     paint_knob(ui, rect, label, spec, *u);
+    resp.widget_info(|| {
+        egui::WidgetInfo::slider(
+            true,
+            *u as f64,
+            format!("{label}: {}", spec.format(spec.denorm(*u))),
+        )
+    });
     let mut resp = resp.on_hover_text(format!(
-        "{}: {}\ndrag or arrows (shift = fine), scroll, double-click to reset",
+        "{}: {}\ndrag or arrows (shift = fine), Alt+scroll, double-click to reset",
         label,
         spec.format(spec.denorm(*u))
     ));
@@ -156,32 +184,21 @@ fn paint_knob(ui: &Ui, rect: Rect, label: &str, spec: &ParamSpec, u: f32) {
     );
 }
 
-/// Stompbox LED + bypass. Clicking the light toggles the effect.
+/// Accessible native bypass control. The text shares the allocated button footprint.
 pub fn led(ui: &mut Ui, on: bool, label: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::click());
-    let c = rect.center();
-    let fill = if on {
-        Color32::from_rgb(255, 90, 60)
+    ui.selectable_label(on, label).on_hover_text(if on {
+        "Active; click to bypass"
     } else {
-        Color32::from_rgb(70, 40, 38)
-    };
-    ui.painter().circle_filled(c, 5.5, fill);
-    ui.painter().circle_stroke(c, 6.5, Stroke::new(1.0, TRACK));
-    if !label.is_empty() {
-        ui.painter().text(
-            Pos2::new(rect.max.x + 4.0, c.y),
-            Align2::LEFT_CENTER,
-            label,
-            label_font(),
-            DIM,
-        );
-    }
-    resp.on_hover_text(if on { "bypass" } else { "engage" })
+        "Bypassed; click to activate"
+    })
 }
 
 /// Map a linear level to 0..=1 on a log scale, floor at -60 dB.
 fn db_unit(x: f32) -> f32 {
-    ((x.max(1e-5)).ln() / 1e-5f32.ln()).clamp(0.0, 1.0)
+    if !x.is_finite() || x <= 0.0 {
+        return 0.0;
+    }
+    ((20.0 * x.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
 /// Horizontal level bar: filled = RMS, bright cap = peak hold.
@@ -275,8 +292,8 @@ fn frame(ui: &Ui, title: &str, area: Rect) {
 ///
 /// The window is the engine's last few thousand frames, so this is what actually came out
 /// of the DAC -- not a prediction from the shaper's math.
-pub fn scope(ui: &mut Ui, din: &[f32], dout: &[f32], sr: f32, ms: f32) -> Response {
-    let (area, resp) = ui.allocate_exact_size(Vec2::new(340.0, 150.0), Sense::hover());
+pub fn scope(ui: &mut Ui, din: &[f32], dout: &[f32], sr: f32, ms: f32, size: Vec2) -> Response {
+    let (area, resp) = ui.allocate_exact_size(size, Sense::hover());
     frame(
         ui,
         &format!("scope — last {ms:.0} ms ({} Hz)", sr as u32),
@@ -322,8 +339,8 @@ pub fn scope(ui: &mut Ui, din: &[f32], dout: &[f32], sr: f32, ms: f32) -> Respon
 /// squares off, or pumps shows up as the cloud peeling off that line and going flat.
 /// Memory-based effects (delay, reverb, chorus) legitimately make a thick cloud rather than
 /// a curve, because their output does not depend on the current input alone.
-pub fn transfer(ui: &mut Ui, din: &[f32], dout: &[f32]) -> Response {
-    let (area, resp) = ui.allocate_exact_size(Vec2::new(220.0, 150.0), Sense::hover());
+pub fn transfer(ui: &mut Ui, din: &[f32], dout: &[f32], size: Vec2) -> Response {
+    let (area, resp) = ui.allocate_exact_size(size, Sense::hover());
     frame(ui, "input → output", area);
     if din.len() != dout.len() || din.len() < 2 {
         return resp;
@@ -376,7 +393,7 @@ pub fn knob_row(
     norms: &mut [f32],
     mut send: impl FnMut(usize, f32),
 ) {
-    ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
+    ui.horizontal_wrapped(|ui| {
         for (i, spec) in specs.iter().enumerate() {
             if i >= norms.len() {
                 break;
@@ -392,12 +409,6 @@ pub fn knob_row(
     });
 }
 
-/// Muted microcopy, defined once. Before this, two ad-hoc greys (150 and 120) were
-/// hand-applied at a dozen call sites, and `from_gray(120)` at 11px sits under the WCAG
-/// 4.5:1 line on this background -- so the dimmest labels were also the ones you most
-/// need to read (device names, buffer size, what a control does).
-pub const MUTED: egui::Color32 = egui::Color32::from_gray(170);
-
 /// A section heading: one size, one weight, one colour. AMP / RACK / WAVE were three
 /// anonymous clusters of identical cards, which gives the eye nothing to scan against --
 /// and the amp, the block you touch least, looked exactly like the pedals you tune constantly.
@@ -410,4 +421,18 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
             .color(MUTED),
     );
     ui.separator();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meter_scale_maps_minus_sixty_db_to_empty_and_unity_to_full() {
+        assert_eq!(db_unit(0.0), 0.0);
+        assert_eq!(db_unit(f32::NAN), 0.0);
+        assert!((db_unit(10f32.powf(-1.5)) - 0.5).abs() < 0.001);
+        assert_eq!(db_unit(1.0), 1.0);
+        assert_eq!(db_unit(2.0), 1.0);
+    }
 }

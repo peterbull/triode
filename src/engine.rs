@@ -36,7 +36,7 @@ use crate::dsp::{db2lin, sanitize, Frame, MAX_CHUNK};
 use crate::params::{amp_ix, EffectKind, ParamVals, AMP_SPECS, MAX_SLOTS};
 
 /// A processing element. Implementations must not allocate, lock or block inside
-/// `process`; construction and `set_rates` may allocate.
+/// `process` or `set_rates`; only construction may allocate.
 pub trait Proc: Send {
     /// Recompute sample-rate-dependent state (coefficient caches, delay lengths).
     fn set_rates(&mut self, _sr: f32) {}
@@ -152,7 +152,7 @@ pub enum Cmd {
     /// Insert a slot built on the UI thread at index `at` (clamped).
     InsertSlot {
         at: usize,
-        slot: Box<Slot>,
+        slot: Slot,
     },
     RemoveSlot {
         slot: usize,
@@ -164,15 +164,15 @@ pub enum Cmd {
     /// Replace the kind at `slot`, keeping its position. State is intentionally new.
     ReplaceSlot {
         slot: usize,
-        with: Box<Slot>,
+        with: Slot,
     },
     AmpParam {
         idx: usize,
         norm: f32,
     },
     Flag(Flag, bool),
-    LoadIr(Box<Ir>),
-    ClearIr,
+    /// Complete cabinet prepared off-thread, including convolution buffers.
+    LoadCab(Box<Cab>),
     /// Replace the whole rack at once (preset load). Built on the UI thread for the same
     /// reason as [`Cmd::InsertSlot`], and truncated to [`MAX_SLOTS`] on the way in.
     LoadRack(Vec<Slot>),
@@ -263,7 +263,7 @@ pub const SCOPE_FRAMES: usize = 2048;
 /// Deliberately plain `VecDeque`s behind one mutex rather than a lock-free ring: the
 /// audio thread fills it with `try_lock` and simply skips a block when the UI is reading,
 /// so a stalled UI costs a dropped waveform frame, never a glitched audio callback.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Scope {
     pub din: VecDeque<f32>,
     pub dout: VecDeque<f32>,
@@ -273,10 +273,23 @@ pub struct Scope {
     pub seq: u64,
 }
 
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            din: VecDeque::with_capacity(SCOPE_FRAMES),
+            dout: VecDeque::with_capacity(SCOPE_FRAMES),
+            sr: 0.0,
+            seq: 0,
+        }
+    }
+}
+
 /// State shared between the UI, the audio-thread owner, and both cpal callbacks.
-#[derive(Default)]
 pub struct Shared {
     pub cmds: Mutex<VecDeque<Cmd>>,
+    // Fixed-capacity return path: callback hands ownership back, never frees it.
+    retired: Mutex<Vec<Cmd>>,
+    pub applied: Mutex<Option<ReopenReq>>,
     pub stats: Stats,
     /// Set by the audio-thread owner once streams are live.
     pub ready: AtomicBool,
@@ -295,13 +308,60 @@ pub struct Shared {
     pub tone_hz: AtomicU32,
 }
 
+const MAX_COMMANDS: usize = 64;
+
+impl Default for Shared {
+    fn default() -> Self {
+        let shared = Self {
+            cmds: Mutex::new(VecDeque::new()),
+            retired: Mutex::new(Vec::with_capacity(MAX_COMMANDS)),
+            applied: Mutex::new(None),
+            stats: Stats::default(),
+            ready: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            reopen: Mutex::new(None),
+            status: Mutex::new(String::new()),
+            scope: Mutex::new(Scope::default()),
+            scope_on: AtomicBool::new(true),
+            tone_hz: AtomicU32::new(0),
+        };
+        // macOS std mutexes allocate their native lock on first use, even try_lock.
+        // Warm every callback-facing lock here, before either audio stream can run.
+        drop(shared.cmds.lock().expect("new command mutex"));
+        drop(shared.retired.lock().expect("new retirement mutex"));
+        drop(shared.scope.lock().expect("new scope mutex"));
+        shared
+    }
+}
+
 impl Shared {
     pub fn new() -> Arc<Shared> {
-        Arc::new(Shared {
-            status: Mutex::new(String::new()),
-            scope_on: AtomicBool::new(true),
-            ..Default::default()
-        })
+        Arc::new(Shared::default())
+    }
+
+    /// UI/audio-owner thread only. Drop retired processors outside the callback.
+    pub fn collect_retired(&self) {
+        self.retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    pub fn load_ir(&self, ir: Ir) {
+        let mut cab = Cab::new(self.preparation_rate());
+        cab.load_ir(ir);
+        self.send(Cmd::LoadCab(Box::new(cab)));
+    }
+
+    pub fn clear_ir(&self) {
+        self.send(Cmd::LoadCab(Box::new(Cab::new(self.preparation_rate()))));
+    }
+
+    fn preparation_rate(&self) -> f32 {
+        match self.stats.rate.load(Ordering::Relaxed) {
+            0 => 44100.0,
+            sr => sr as f32,
+        }
     }
 
     pub fn set_scope(&self, on: bool) {
@@ -332,7 +392,13 @@ impl Shared {
         ))
     }
 
-    pub fn send(&self, cmd: Cmd) {
+    pub fn send(&self, mut cmd: Cmd) {
+        self.collect_retired();
+        if let Cmd::LoadRack(slots) = &mut cmd {
+            // Preparation belongs to the caller, not the callback. Preserve room for edits.
+            slots.truncate(MAX_SLOTS);
+            slots.reserve(MAX_SLOTS - slots.len());
+        }
         // Lock only long enough to push a small enum; never while building anything.
         // A poisoned `Mutex<VecDeque>` is still sound to use: the guard's panic left the
         // queue intact, not structurally broken. Clearing it here would silently discard
@@ -373,9 +439,9 @@ pub const FULL_SCALE: f32 = 1.0;
 pub struct Engine {
     pub slots: Vec<Slot>,
     pub amp: Amp,
-    pub cab: Cab,
+    pub cab: Box<Cab>,
     limiter: Limiter,
-    out_dc: DcBlocker,
+    out_dc: [DcBlocker; 2],
     in_dc: DcBlocker,
     in_hpf: Biquad,
     amp_target: ParamVals,
@@ -416,9 +482,9 @@ impl Engine {
         let mut e = Engine {
             slots: Vec::new(),
             amp: Amp::new(sr),
-            cab: Cab::new(sr),
+            cab: Box::new(Cab::new(sr)),
             limiter: Limiter::new(),
-            out_dc: DcBlocker::new(),
+            out_dc: [DcBlocker::new(), DcBlocker::new()],
             in_dc: DcBlocker::new(),
             in_hpf: Biquad::new(Coef::highpass(75.0, 0.707, sr)),
             amp_target: norms,
@@ -455,15 +521,20 @@ impl Engine {
 
     /// The engine runs at the *output* device's rate; input is resampled to it.
     pub fn set_rates(&mut self, in_rate: f32, out_rate: f32) {
-        self.sr = out_rate.max(1.0);
-        self.in_sr = in_rate.max(1.0);
+        self.sr = sanitize(out_rate, 48000.0, 8000.0, 192000.0);
+        self.in_sr = sanitize(in_rate, self.sr, 8000.0, 192000.0);
         self.step_base = self.in_sr / self.sr;
         self.step = self.step_base;
+        self.resampler.reset();
         self.resampler.set_step(self.step);
+        self.in_dc.reset();
+        self.in_hpf.reset();
         self.amp.set_rates(self.sr);
         self.cab.set_rates(self.sr);
         self.limiter.set_rates(self.sr);
-        self.out_dc.set_hz(20.0, self.sr);
+        for dc in &mut self.out_dc {
+            dc.set_hz(20.0, self.sr);
+        }
         self.in_dc.set_hz(15.0, self.sr);
         self.in_hpf.set(Coef::highpass(75.0, 0.707, self.sr));
         for s in self.slots.iter_mut() {
@@ -508,13 +579,24 @@ impl Engine {
             Err(TryLockError::WouldBlock) => return,
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
         };
-        for _ in 0..64 {
+        let mut retired = match shared.retired.try_lock() {
+            Ok(r) => r,
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        for _ in 0..MAX_COMMANDS {
+            // Keep the command queued if its return value might not fit. No lost edits.
+            if retired.len() == retired.capacity() {
+                break;
+            }
             let Some(cmd) = queue.pop_front() else { break };
-            self.apply(cmd);
+            if let Some(old) = self.apply(cmd) {
+                retired.push(old);
+            }
         }
     }
 
-    fn apply(&mut self, cmd: Cmd) {
+    fn apply(&mut self, cmd: Cmd) -> Option<Cmd> {
         match cmd {
             Cmd::SetParam { slot, idx, norm } => {
                 if let Some(s) = self.slots.get_mut(slot) {
@@ -535,12 +617,17 @@ impl Engine {
                     let at = at.min(self.slots.len());
                     let mut slot = slot;
                     slot.proc.set_rates(self.sr);
-                    self.slots.insert(at, *slot);
+                    self.slots.insert(at, slot);
+                } else {
+                    return Some(Cmd::InsertSlot { at, slot });
                 }
             }
             Cmd::RemoveSlot { slot } => {
                 if slot < self.slots.len() {
-                    self.slots.remove(slot);
+                    return Some(Cmd::InsertSlot {
+                        at: slot,
+                        slot: self.slots.remove(slot),
+                    });
                 }
             }
             Cmd::MoveSlot { from, to } => {
@@ -552,18 +639,19 @@ impl Engine {
             }
             Cmd::LoadRack(slots) => {
                 let mut slots = slots;
-                slots.truncate(MAX_SLOTS);
                 for s in slots.iter_mut() {
                     s.proc.set_rates(self.sr);
                 }
-                self.slots = slots;
+                return Some(Cmd::LoadRack(std::mem::replace(&mut self.slots, slots)));
             }
             Cmd::ReplaceSlot { slot, with } => {
                 if slot < self.slots.len() {
                     let mut with = with;
                     with.proc.set_rates(self.sr);
-                    self.slots[slot] = *with;
+                    let old = std::mem::replace(&mut self.slots[slot], with);
+                    return Some(Cmd::ReplaceSlot { slot, with: old });
                 }
+                return Some(Cmd::ReplaceSlot { slot, with });
             }
             Cmd::AmpParam { idx, norm } => self.set_amp_param(idx, norm),
             Cmd::Flag(flag, on) => match flag {
@@ -571,9 +659,12 @@ impl Engine {
                 Flag::InputHpf => self.hpf_on = on,
                 Flag::Muted => self.muted = on,
             },
-            Cmd::LoadIr(ir) => self.cab.load_ir(*ir),
-            Cmd::ClearIr => self.cab.clear_ir(),
+            Cmd::LoadCab(mut cab) => {
+                cab.set_rates(self.sr);
+                return Some(Cmd::LoadCab(std::mem::replace(&mut self.cab, cab)));
+            }
         }
+        None
     }
 
     /// Process `out.len()` output frames: pull input, run the chain, write out.
@@ -599,7 +690,7 @@ impl Engine {
             let take = n.min(MAX_CHUNK - c);
             if take > 0 {
                 for i in 0..take {
-                    let f = self.scratch[c + i];
+                    let f = self.scratch[i];
                     self.cap_in[c + i] = 0.5 * (f[0] + f[1]);
                 }
             }
@@ -607,7 +698,7 @@ impl Engine {
             let c2 = self.cap_n.min(MAX_CHUNK);
             let take2 = n.min(MAX_CHUNK - c2);
             for i in 0..take2 {
-                let f = self.scratch[c2 + i];
+                let f = self.scratch[i];
                 self.cap_out[c2 + i] = 0.5 * (f[0] + f[1]);
             }
             self.cap_n = (self.cap_n + n).min(MAX_CHUNK);
@@ -652,13 +743,13 @@ impl Engine {
         // which is far below audible pitch change for a guitar.
         let target = (self.sr * 0.005).max(32.0);
         let level = src.level();
-        if self.step_base != 1.0 || level > 0 {
-            let err = (level as f32 - target) / (target * 8.0);
+        if let Some(clock_level) = src.clock_level() {
+            let err = (clock_level as f32 - target) / (target * 8.0);
             let corr = 1.0 + err.clamp(-0.001, 0.001);
             self.step =
                 (self.step_base * corr).clamp(self.step_base * 0.999, self.step_base * 1.001);
         } else {
-            self.step = 1.0;
+            self.step = self.step_base;
         }
         self.resampler.set_step(self.step);
         if level == 0 {
@@ -739,8 +830,8 @@ impl Engine {
             f[0] *= master;
             f[1] *= master;
             self.limiter.process(f, CEILING);
-            f[0] = self.out_dc.process(f[0]);
-            f[1] = self.out_dc.process(f[1]);
+            f[0] = self.out_dc[0].process(f[0]);
+            f[1] = self.out_dc[1].process(f[1]);
             // Brickwall, deliberately last. The limiter above clamps to `CEILING`, but the
             // DC blocker runs after it and is a highpass: on a clamped transient it can ring
             // and put a sample back over the ceiling. This is what makes "no output sample
@@ -750,6 +841,10 @@ impl Engine {
             // withdrawn; the ordering reason above stands on its own.)
             f[0] = f[0].clamp(-FULL_SCALE, FULL_SCALE);
             f[1] = f[1].clamp(-FULL_SCALE, FULL_SCALE);
+            // Mute is the final safety switch, including residual DC-filter history.
+            if self.muted {
+                *f = [0.0; 2];
+            }
             self.meter_out.push_frame(f[0], f[1]);
             if let Some(t) = self.taps.as_mut() {
                 t.push(after_slots + 2, f);
@@ -769,7 +864,6 @@ impl Engine {
         put(&s.gr_db, self.limiter.reduction_db());
         s.rate.store(self.sr as u32, Ordering::Relaxed);
         put(&s.ratio, self.step / self.step_base.max(f32::MIN_POSITIVE));
-        s.buffer_frames.store(self.chunk as u32, Ordering::Relaxed);
         s.ring_frames.store(src.level() as u32, Ordering::Relaxed);
         if ic {
             s.clip_in.fetch_add(1, Ordering::Relaxed);
@@ -862,7 +956,7 @@ impl Engine {
         &self.limiter
     }
 
-    /// Replace the whole rack (preset load). Audio-thread side of a preset apply.
+    /// Initial rack preparation, outside the callback. Live edits use `Cmd::LoadRack`.
     pub fn load_rack(&mut self, slots: Vec<Slot>) {
         self.slots.clear();
         for mut s in slots.into_iter().take(MAX_SLOTS) {
@@ -1023,7 +1117,7 @@ mod tests {
         let mut e = engine();
         shared.send(Cmd::InsertSlot {
             at: 0,
-            slot: Box::new(Slot::build(EffectKind::Boost, false, 48000.0)),
+            slot: Slot::build(EffectKind::Boost, false, 48000.0),
         });
         shared.send(Cmd::SetEnabled { slot: 0, on: true });
         shared.send(Cmd::SetParam {
@@ -1057,7 +1151,7 @@ mod tests {
         for i in 0..(MAX_SLOTS + 6) {
             shared.send(Cmd::InsertSlot {
                 at: i,
-                slot: Box::new(Slot::build(EffectKind::Boost, true, 48000.0)),
+                slot: Slot::build(EffectKind::Boost, true, 48000.0),
             });
         }
         let mut out = [[0.0f32; 2]; 16];
@@ -1204,14 +1298,14 @@ mod tests {
         let shared = Shared::new();
         let mut e = engine();
         e.slots.push(Slot::build(EffectKind::Boost, true, 48000.0));
-        shared.send(Cmd::Flag(Flag::Muted, true));
         let mut src = Const(0.5);
         let mut out = [[0.0f32; 2]; 256];
-        for _ in 0..20 {
-            e.process(Some(&shared), &mut src, &mut out);
-        }
+        e.process(Some(&shared), &mut src, &mut out);
+        assert!(out.iter().flatten().any(|s| *s != 0.0));
+        shared.send(Cmd::Flag(Flag::Muted, true));
+        e.process(Some(&shared), &mut src, &mut out);
         assert!(
-            out.iter().flatten().all(|s| s.abs() < 1e-6),
+            out.iter().flatten().all(|s| *s == 0.0),
             "muted output leaked"
         );
     }

@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn thd_rises_with_distortion() {
         let clean = sine(16384, 200.0, SR, 0.2);
-        let clipped: Vec<f32> = clean.iter().map(|s| s.max(-0.02).min(0.02)).collect();
+        let clipped: Vec<f32> = clean.iter().map(|s| s.clamp(-0.02, 0.02)).collect();
         assert!(thd(&clean, 200.0, SR) < 1e-3);
         // thd() sums harmonics 2..=5, and a *perfect* square only reaches 0.43 there
         // (1/3, 1/5, 1/7, 1/9). Demanding more was demanding a wrong measurement.

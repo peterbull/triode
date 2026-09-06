@@ -159,9 +159,9 @@ impl Proc for Reverb {
         // one-pole coefficient, so higher damp keeps more high end in the loop.
         let damp_coef = 0.2 + 0.7 * damp;
 
-        let len_l: Vec<usize> = self.combs_l.iter().map(|c| c.len(scale, size)).collect();
-        let len_r: Vec<usize> = self.combs_r.iter().map(|c| c.len(scale, size)).collect();
-        let len_ap: Vec<usize> = self.ap_l.iter().map(|a| a.len(scale)).collect();
+        let len_l: [usize; 4] = std::array::from_fn(|i| self.combs_l[i].len(scale, size));
+        let len_r: [usize; 4] = std::array::from_fn(|i| self.combs_r[i].len(scale, size));
+        let len_ap: [usize; 4] = std::array::from_fn(|i| self.ap_l[i].len(scale));
 
         for f in buf[..n].iter_mut() {
             let (dry_l, dry_r) = (f[0], f[1]);
@@ -177,9 +177,9 @@ impl Proc for Reverb {
             }
             wet_l *= 0.25;
             wet_r *= 0.25;
-            for i in 0..self.ap_l.len() {
-                wet_l = self.ap_l[i].process(wet_l, len_ap[i]);
-                wet_r = self.ap_r[i].process(wet_r, len_ap[i]);
+            for ((left, right), len) in self.ap_l.iter_mut().zip(&mut self.ap_r).zip(len_ap) {
+                wet_l = left.process(wet_l, len);
+                wet_r = right.process(wet_r, len);
             }
 
             f[0] = dry_l * (1.0 - mix) + wet_l * WET_GAIN * mix;

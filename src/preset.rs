@@ -158,10 +158,10 @@ impl Preset {
         for sp in self.slots.iter_mut() {
             let specs = sp.kind.params();
             sp.params.truncate(specs.len());
-            for i in 0..specs.len() {
+            for (i, spec) in specs.iter().enumerate() {
                 let n = match sp.params.get(i) {
                     Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
-                    _ => specs[i].default_norm(),
+                    _ => spec.default_norm(),
                 };
                 if sp.params.len() <= i {
                     sp.params.push(n);
@@ -172,10 +172,10 @@ impl Preset {
         }
         let specs = &AMP_SPECS[..];
         self.amp.truncate(specs.len());
-        for i in 0..specs.len() {
+        for (i, spec) in specs.iter().enumerate() {
             let n = match self.amp.get(i) {
                 Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
-                _ => specs[i].default_norm(),
+                _ => spec.default_norm(),
             };
             if self.amp.len() <= i {
                 self.amp.push(n);
@@ -359,9 +359,9 @@ mod tests {
         let slots = p.to_slots(48000.0);
         assert_eq!(slots.len(), 1);
         let specs = EffectKind::Delay.params();
-        for i in 1..specs.len() {
+        for (i, spec) in specs.iter().enumerate().skip(1) {
             assert!(
-                (slots[0].target.v[i] - specs[i].default_norm()).abs() < 1e-6,
+                (slots[0].target.v[i] - spec.default_norm()).abs() < 1e-6,
                 "knob {i} not defaulted"
             );
         }

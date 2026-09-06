@@ -18,14 +18,14 @@ const TILT_RANGE_DB: f32 = 8.0;
 #[derive(Debug, Default)]
 pub struct Boost {
     sr: f32,
-    lp: OnePole,
+    lp: [OnePole; 2],
 }
 
 impl Boost {
     pub fn new() -> Boost {
         Boost {
             sr: 48000.0,
-            lp: OnePole::new(),
+            lp: [OnePole::new(); 2],
         }
     }
 }
@@ -33,7 +33,9 @@ impl Boost {
 impl Proc for Boost {
     fn set_rates(&mut self, sr: f32) {
         self.sr = sr.max(1.0);
-        self.lp.set_hz(TILT_HZ, self.sr);
+        for lp in self.lp.iter_mut() {
+            lp.set_hz(TILT_HZ, self.sr);
+        }
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
@@ -43,15 +45,17 @@ impl Proc for Boost {
         let hi = db2lin((tilt - 0.5) * TILT_RANGE_DB);
 
         for f in buf[..n].iter_mut() {
-            for ch in f.iter_mut() {
-                let low = self.lp.lowpass(*ch);
-                *ch = (low * lo + (*ch - low) * hi) * level;
+            for (channel, sample) in f.iter_mut().enumerate() {
+                let low = self.lp[channel].lowpass(*sample);
+                *sample = (low * lo + (*sample - low) * hi) * level;
             }
         }
     }
 
     fn reset(&mut self) {
-        self.lp.reset();
+        for lp in self.lp.iter_mut() {
+            lp.reset();
+        }
     }
 }
 
@@ -77,6 +81,32 @@ mod tests {
         let n = buf.len();
         b.process(&mut buf, n, p);
         buf.iter().map(|f| f[0]).collect()
+    }
+
+    #[test]
+    fn channel_histories_are_independent() {
+        let x = sine(4096, 700.0, SR, 0.4);
+        let p = params(0.0, 0.0);
+
+        let mut matching = Boost::new();
+        matching.set_rates(SR);
+        let mut stereo: Vec<Frame> = x.iter().map(|s| [*s, *s]).collect();
+        let n = stereo.len();
+        matching.process(&mut stereo, n, &p);
+        assert!(
+            stereo.iter().all(|f| (f[0] - f[1]).abs() < 1e-7),
+            "identical inputs must remain identical"
+        );
+
+        let mut isolated = Boost::new();
+        isolated.set_rates(SR);
+        let mut left_only: Vec<Frame> = x.iter().map(|s| [*s, 0.0]).collect();
+        let n = left_only.len();
+        isolated.process(&mut left_only, n, &p);
+        assert!(
+            left_only.iter().all(|f| f[1].abs() < 1e-7),
+            "left input leaked into right output"
+        );
     }
 
     #[test]

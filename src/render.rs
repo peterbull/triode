@@ -75,13 +75,19 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
         WavReader::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let spec = reader.spec();
     let sr = spec.sample_rate;
-    let ch = spec.channels.max(1) as usize;
+    if spec.channels == 0 || !(8000..=192000).contains(&sr) {
+        return Err(format!(
+            "unsupported WAV format: {} channels at {sr} Hz",
+            spec.channels
+        ));
+    }
+    let ch = spec.channels as usize;
     let bits = spec.bits_per_sample;
 
     let mut out = Vec::new();
     match spec.sample_format {
         SampleFormat::Float => match bits {
-            32 => mix_in(&mut out, reader.samples::<f32>(), ch),
+            32 => mix_in(&mut out, reader.samples::<f32>(), ch)?,
             other => {
                 return Err(format!(
                     "unsupported float depth {other}-bit in {}",
@@ -96,7 +102,7 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
                     &mut out,
                     reader.samples::<i8>().map(|s| s.map(|v| v as f32 * scale)),
                     ch,
-                );
+                )?;
             }
             16 => {
                 let scale = 1.0 / 32768.0;
@@ -104,15 +110,17 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
                     &mut out,
                     reader.samples::<i16>().map(|s| s.map(|v| v as f32 * scale)),
                     ch,
-                );
+                )?;
             }
             24 | 32 => {
-                let scale = 1.0 / 2_147_483_648.0;
+                // Hound decodes integers at their native bit depth, not left-aligned.
+                // https://docs.rs/hound/3.5.1/hound/trait.Sample.html
+                let scale = 1.0 / (1_u64 << (bits - 1)) as f32;
                 mix_in(
                     &mut out,
                     reader.samples::<i32>().map(|s| s.map(|v| v as f32 * scale)),
                     ch,
-                );
+                )?;
             }
             other => {
                 return Err(format!(
@@ -125,23 +133,31 @@ pub fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
     Ok((out, sr))
 }
 
-/// Interleave-aware mixdown to mono. Decode errors skip the sample rather than failing the
-/// whole file — a truncated tail should still render.
-fn mix_in<E>(out: &mut Vec<f32>, samples: impl Iterator<Item = Result<f32, E>>, channels: usize) {
-    let mut acc = 0.0f32;
+/// Decode failures must not silently shift interleaved channel alignment.
+fn mix_in<E: std::fmt::Display>(
+    out: &mut Vec<f32>,
+    samples: impl Iterator<Item = Result<f32, E>>,
+    channels: usize,
+) -> Result<(), String> {
+    let mut acc = 0.0f64;
     let mut n = 0usize;
-    for s in samples.flatten() {
-        acc += s;
+    for s in samples {
+        let s = s.map_err(|e| format!("WAV decode failed: {e}"))?;
+        if !s.is_finite() {
+            return Err("WAV contains a non-finite sample".into());
+        }
+        acc += s as f64;
         n += 1;
         if n == channels {
-            out.push(acc / channels as f32);
+            out.push((acc / channels as f64) as f32);
             acc = 0.0;
             n = 0;
         }
     }
-    if n > 0 {
-        out.push(acc / channels as f32);
+    if n != 0 {
+        return Err("WAV ends with an incomplete channel frame".into());
     }
+    Ok(())
 }
 
 /// Write stereo f32 frames as an interleaved WAV.
@@ -172,18 +188,10 @@ pub fn write_wav_stereo(path: &Path, frames: &[Frame], sr: u32) -> Result<(), St
 /// Seconds of deliberate input-less tail so delay and reverb decay land in the file.
 const TAIL_SECONDS: usize = 2;
 
-/// Chunks of pure tail, at the engine's chunk size.
-fn tail_chunks(chunk: usize, sr: u32) -> usize {
-    (TAIL_SECONDS * sr as usize / chunk).max(1)
-}
-
-/// Chunks to run so every input sample is pulled through, plus the tail.
-///
-/// Deliberately a fixed count rather than "stop when the source runs dry": the engine pulls
-/// no input at all on its first calls while the resampler primes its window, so starvation is
-/// normal start-up behaviour and using it as a stop condition ended a render after one chunk.
-fn total_chunks(in_frames: usize, chunk: usize, sr: u32) -> usize {
-    in_frames.div_ceil(chunk) + tail_chunks(chunk, sr) + 4
+/// Output-clock duration plus tail, rounded once to the processing block boundary.
+fn total_chunks(in_frames: usize, input_sr: u32, chunk: usize, sr: u32) -> usize {
+    let frames = (in_frames as u64 * sr as u64).div_ceil(input_sr as u64) as usize;
+    (frames + TAIL_SECONDS * sr as usize).div_ceil(chunk)
 }
 
 pub fn render(input: &Path, output: &Path, opts: &Options) -> Result<Report, String> {
@@ -197,6 +205,7 @@ pub fn render(input: &Path, output: &Path, opts: &Options) -> Result<Report, Str
     // The mailbox is drained inside `engine_from_preset`; held alive here so the
     // engine's switch state stays exactly as the preset set it.
     let (mut engine, _shared) = engine_from_preset(&opts.preset, sr as f32, chunk);
+    engine.set_rates(file_sr as f32, sr as f32);
     let mut src = SliceSource::new(&mono);
     let mut out: Vec<Frame> = Vec::with_capacity(mono.len() + chunk);
     let mut buf = [[0.0f32; 2]; MAX_CHUNK];
@@ -206,13 +215,8 @@ pub fn render(input: &Path, output: &Path, opts: &Options) -> Result<Report, Str
         frames_in: mono.len(),
         ..Default::default()
     };
-    // A fixed chunk count, not a starvation check. The engine pulls no input at all on
-    // its first calls while the resampler primes its window, so "consumed nothing this
-    // block" is normal start-up rather than the source running dry -- breaking on it used
-    // to end the render after a single chunk. Instead: enough chunks to pull every input
-    // sample through, plus a two-second tail so delay/reverb decay is in the file.
-    let _tail_chunks = tail_chunks(chunk, sr);
-    let total_chunks = total_chunks(mono.len(), chunk, sr);
+    // Include every resampled input frame and the delay/reverb tail.
+    let total_chunks = total_chunks(mono.len(), file_sr, chunk, sr);
     for _ in 0..total_chunks {
         engine.process(None, &mut src, &mut buf[..chunk]);
         for f in buf[..chunk].iter() {
@@ -286,7 +290,8 @@ pub fn trace(
     }
     let sr = rate.unwrap_or(file_sr).clamp(8000, 192_000);
     let (mut engine, _shared) = engine_from_preset(preset, sr as f32, chunk);
-    let chunks = total_chunks(mono.len(), chunk, sr);
+    engine.set_rates(file_sr as f32, sr as f32);
+    let chunks = total_chunks(mono.len(), file_sr, chunk, sr);
     engine.enable_taps(chunks * chunk);
 
     let mut src = SliceSource::new(&mono);
@@ -323,6 +328,39 @@ mod tests {
     use super::*;
     use crate::dsp::analysis::{any_non_finite, mean, peak, pluck, rms};
     use crate::params::amp_ix;
+
+    #[test]
+    fn pcm_bit_depths_preserve_quarter_scale() {
+        let dir = std::env::temp_dir().join(format!("triode-pcm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for bits in [16, 24, 32] {
+            let path = dir.join(format!("{bits}.wav"));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48000,
+                bits_per_sample: bits,
+                sample_format: SampleFormat::Int,
+            };
+            let mut writer = WavWriter::create(&path, spec).unwrap();
+            writer.write_sample(1_i32 << (bits - 3)).unwrap();
+            writer.finalize().unwrap();
+            let (samples, _) = read_wav_mono(&path).unwrap();
+            assert_eq!(samples, vec![0.25], "{bits}-bit scaling");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn converted_trace_keeps_the_generated_fundamental() {
+        for sr in [44100, 48000, 96000] {
+            let (_, stages) = trace(None, &Preset::empty(), 128, Some(sr), None).unwrap();
+            assert!(
+                stages[0].thd < 0.02,
+                "input fundamental moved at {sr}: {}",
+                stages[0].thd
+            );
+        }
+    }
 
     /// The whole point of tap points: a quiet output is not evidence of where it went quiet,
     /// so assert on every boundary of the demo patch instead of only the last one. A stage
@@ -529,19 +567,29 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let input = dir.join("in.wav");
         let output = dir.join("out.wav");
-        let note = pluck(20000, 220.0, 44100.0, 300.0);
-        write_test_wav(&input, &note, 44100);
-        for rate in [44100u32, 48000, 96000] {
-            let opts = Options {
-                preset: Preset::blues(),
-                chunk: 128,
-                rate: Some(rate),
-            };
-            let report = render(&input, &output, &opts).unwrap();
-            assert_eq!(report.sr, rate);
-            let (rendered, sr) = read_wav_mono(&output).unwrap();
-            assert_eq!(sr, rate);
-            assert!(!any_non_finite(&rendered));
+        for input_rate in [44100, 96000] {
+            let note = pluck(20000, 220.0, input_rate as f32, 300.0);
+            write_test_wav(&input, &note, input_rate);
+            for rate in [44100u32, 48000, 96000] {
+                let opts = Options {
+                    preset: Preset::blues(),
+                    chunk: 128,
+                    rate: Some(rate),
+                };
+                let report = render(&input, &output, &opts).unwrap();
+                assert_eq!(report.sr, rate);
+                let expected_frames = (((20000.0 / input_rate as f64 + 2.0) * rate as f64 / 128.0)
+                    .ceil() as usize)
+                    * 128;
+                assert_eq!(
+                    report.frames_out, expected_frames,
+                    "duration at {input_rate} -> {rate}"
+                );
+                let (rendered, sr) = read_wav_mono(&output).unwrap();
+                assert_eq!(sr, rate);
+                assert_eq!(rendered.len(), expected_frames);
+                assert!(!any_non_finite(&rendered));
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -24,16 +24,16 @@ pub mod fuzz_ix {
 /// looking one-pole tone cut. Keeps the low end (the thing a cheap overdrive ruins).
 pub struct Overdrive {
     sr: f32,
-    clip: Clip2x,
-    tone: OnePole,
+    clip: [Clip2x; 2],
+    tone: [OnePole; 2],
 }
 
 impl Overdrive {
     pub fn new() -> Overdrive {
         Overdrive {
             sr: 48000.0,
-            clip: Clip2x::new(48000.0),
-            tone: OnePole::new(),
+            clip: [Clip2x::new(48000.0), Clip2x::new(48000.0)],
+            tone: [OnePole::new(); 2],
         }
     }
 }
@@ -47,14 +47,18 @@ impl Default for Overdrive {
 impl Proc for Overdrive {
     fn set_rates(&mut self, sr: f32) {
         self.sr = sr.max(1.0);
-        self.clip.set_rates(self.sr);
+        for clip in self.clip.iter_mut() {
+            clip.set_rates(self.sr);
+        }
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
         let drive = sanitize(p.v[od_ix::DRIVE], 0.0, 0.0, 1.0);
         let tone_hz = sanitize(p.v[od_ix::TONE], 3000.0, 80.0, self.sr * 0.45);
         let level = db2lin(sanitize(p.v[od_ix::LEVEL], -60.0, -60.0, 30.0));
-        self.tone.set_hz(tone_hz, self.sr);
+        for tone in self.tone.iter_mut() {
+            tone.set_hz(tone_hz, self.sr);
+        }
 
         let pre = 1.0 + drive * 36.0;
         let t_pos = (0.95 - drive * 0.92).clamp(0.015, 0.99);
@@ -65,16 +69,20 @@ impl Proc for Overdrive {
         let shaper = |v: f32| shape(v, t_pos, t_neg);
 
         for f in buf[..n].iter_mut() {
-            for ch in f.iter_mut() {
-                let x = self.clip.push(*ch * pre, shaper);
-                *ch = self.tone.lowpass(x) * trim * level;
+            for (channel, sample) in f.iter_mut().enumerate() {
+                let x = self.clip[channel].push(*sample * pre, shaper);
+                *sample = self.tone[channel].lowpass(x) * trim * level;
             }
         }
     }
 
     fn reset(&mut self) {
-        self.clip.reset();
-        self.tone.reset();
+        for clip in self.clip.iter_mut() {
+            clip.reset();
+        }
+        for tone in self.tone.iter_mut() {
+            tone.reset();
+        }
     }
 }
 
@@ -83,18 +91,18 @@ impl Proc for Overdrive {
 /// afterwards so the bias never reaches the amp's cab sim.
 pub struct Fuzz {
     sr: f32,
-    clip: Clip2x,
-    tone: OnePole,
-    dc: DcBlocker,
+    clip: [Clip2x; 2],
+    tone: [OnePole; 2],
+    dc: [DcBlocker; 2],
 }
 
 impl Fuzz {
     pub fn new() -> Fuzz {
         Fuzz {
             sr: 48000.0,
-            clip: Clip2x::new(48000.0),
-            tone: OnePole::new(),
-            dc: DcBlocker::new(),
+            clip: [Clip2x::new(48000.0), Clip2x::new(48000.0)],
+            tone: [OnePole::new(); 2],
+            dc: [DcBlocker::new(); 2],
         }
     }
 }
@@ -108,15 +116,21 @@ impl Default for Fuzz {
 impl Proc for Fuzz {
     fn set_rates(&mut self, sr: f32) {
         self.sr = sr.max(1.0);
-        self.clip.set_rates(self.sr);
-        self.dc.set_hz(90.0, self.sr); // fuzz wants its top end, not its bias
+        for clip in self.clip.iter_mut() {
+            clip.set_rates(self.sr);
+        }
+        for dc in self.dc.iter_mut() {
+            dc.set_hz(90.0, self.sr); // fuzz wants its top end, not its bias
+        }
     }
 
     fn process(&mut self, buf: &mut [Frame], n: usize, p: &ParamVals) {
         let fuzz = sanitize(p.v[fuzz_ix::FUZZ], 0.0, 0.0, 1.0);
         let tone_hz = sanitize(p.v[fuzz_ix::TONE], 2400.0, 80.0, self.sr * 0.45);
         let level = db2lin(sanitize(p.v[fuzz_ix::LEVEL], -60.0, -60.0, 30.0));
-        self.tone.set_hz(tone_hz, self.sr);
+        for tone in self.tone.iter_mut() {
+            tone.set_hz(tone_hz, self.sr);
+        }
 
         let pre = 3.0 + fuzz * 220.0;
         let t_pos = (0.6 - fuzz * 0.57).clamp(0.008, 0.9);
@@ -133,18 +147,24 @@ impl Proc for Fuzz {
         let shaper = |v: f32| shape(v, t_pos, t_neg);
 
         for f in buf[..n].iter_mut() {
-            for ch in f.iter_mut() {
-                let x = self.clip.push((*ch + bias) * pre, shaper);
-                let x = self.dc.process(x);
-                *ch = self.tone.lowpass(x) * trim * level;
+            for (channel, sample) in f.iter_mut().enumerate() {
+                let x = self.clip[channel].push((*sample + bias) * pre, shaper);
+                let x = self.dc[channel].process(x);
+                *sample = self.tone[channel].lowpass(x) * trim * level;
             }
         }
     }
 
     fn reset(&mut self) {
-        self.clip.reset();
-        self.tone.reset();
-        self.dc.reset();
+        for clip in self.clip.iter_mut() {
+            clip.reset();
+        }
+        for tone in self.tone.iter_mut() {
+            tone.reset();
+        }
+        for dc in self.dc.iter_mut() {
+            dc.reset();
+        }
     }
 }
 
@@ -171,6 +191,66 @@ mod tests {
         let n = buf.len();
         e.process(&mut buf, n, p);
         buf.iter().map(|f| f[0]).collect()
+    }
+
+    #[test]
+    fn overdrive_channel_histories_are_independent() {
+        let x = sine(4096, 700.0, SR, 0.4);
+        let p = p(EffectKind::Overdrive, [0.8, 5000.0, 0.0]);
+
+        let mut matching = Overdrive::new();
+        matching.set_rates(SR);
+        let mut stereo: Vec<Frame> = x.iter().map(|s| [*s, *s]).collect();
+        let n = stereo.len();
+        matching.process(&mut stereo, n, &p);
+        assert!(
+            stereo.iter().all(|f| (f[0] - f[1]).abs() < 1e-7),
+            "identical inputs must remain identical"
+        );
+
+        let mut isolated = Overdrive::new();
+        isolated.set_rates(SR);
+        let mut left_only: Vec<Frame> = x.iter().map(|s| [*s, 0.0]).collect();
+        let n = left_only.len();
+        isolated.process(&mut left_only, n, &p);
+        assert!(
+            left_only.iter().all(|f| f[1].abs() < 1e-7),
+            "left input leaked into right output"
+        );
+    }
+
+    #[test]
+    fn fuzz_channel_histories_are_independent_of_left_excitation() {
+        let x = sine(4096, 700.0, SR, 0.4);
+        let p = p(EffectKind::Fuzz, [0.8, 5000.0, 0.0]);
+
+        let mut matching = Fuzz::new();
+        matching.set_rates(SR);
+        let mut stereo: Vec<Frame> = x.iter().map(|s| [*s, *s]).collect();
+        let n = stereo.len();
+        matching.process(&mut stereo, n, &p);
+        assert!(
+            stereo.iter().all(|f| (f[0] - f[1]).abs() < 1e-7),
+            "identical inputs must remain identical"
+        );
+
+        let mut excited = Fuzz::new();
+        excited.set_rates(SR);
+        let mut left_only: Vec<Frame> = x.iter().map(|s| [*s, 0.0]).collect();
+        let n = left_only.len();
+        excited.process(&mut left_only, n, &p);
+
+        let mut baseline = Fuzz::new();
+        baseline.set_rates(SR);
+        let mut zero = vec![[0.0f32; 2]; x.len()];
+        baseline.process(&mut zero, n, &p);
+        assert!(
+            left_only
+                .iter()
+                .zip(&zero)
+                .all(|(excited, baseline)| (excited[1] - baseline[1]).abs() < 1e-7),
+            "left excitation changed the right-channel bias response"
+        );
     }
 
     #[test]

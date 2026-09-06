@@ -83,9 +83,9 @@ mod tests {
     fn integer_delay_is_exact_and_lands_on_the_right_sample() {
         let mut dl = DelayLine::new(1024);
         let mut out = vec![0.0f32; 64];
-        for i in 0..64 {
+        for (i, sample) in out.iter_mut().enumerate() {
             let x = if i == 4 { 1.0 } else { 0.0 };
-            out[i] = dl.read(8.0);
+            *sample = dl.read(8.0);
             dl.write(x);
         }
         assert_eq!(peak(&out[..12]), 0.0, "nothing may appear before 8 samples");
@@ -101,8 +101,8 @@ mod tests {
         let mut dl = DelayLine::new(64);
         // Ramp 0,1,2,3... read at 1.5 samples back -> midway between n-1 and n.
         let mut y = [0.0f32; 8];
-        for i in 0..8 {
-            y[i] = dl.read(1.5);
+        for (i, sample) in y.iter_mut().enumerate() {
+            *sample = dl.read(1.5);
             dl.write(i as f32);
         }
         assert!((y[3] - 1.5).abs() < 1e-5, "got {}", y[3]);

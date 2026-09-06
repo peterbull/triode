@@ -11,25 +11,32 @@
 //! and are masked on access, so "full" and "empty" are distinguishable without a flag.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::dsp::next_pow2;
 
+const PRODUCER: u8 = 1;
+const CONSUMER: u8 = 2;
+const RESETTING: u8 = 4;
+
 struct Inner {
-    /// Capacity is a power of two; indexed by `index & mask`.
-    buf: UnsafeCell<Vec<f32>>,
+    /// Each slot has its own interior-mutability boundary. The producer only writes slots
+    /// outside `[tail, head)`, while the consumer only reads slots inside that range.
+    buf: Box<[UnsafeCell<f32>]>,
     mask: usize,
     /// Written by the producer only; read by the consumer.
     head: AtomicUsize,
     /// Written by the consumer only; read by the producer.
     tail: AtomicUsize,
+    /// Runtime enforcement of the SPSC contract, plus exclusive reset access.
+    endpoints: AtomicU8,
 }
 
 unsafe impl Sync for Inner {}
 unsafe impl Send for Inner {}
 
-/// Shared ring. Clone the `Arc`, then split with [`Ring::split`].
+/// Shared ring. Claim one [`Ring::producer`] and one [`Ring::consumer`].
 #[derive(Clone)]
 pub struct Ring {
     inner: Arc<Inner>,
@@ -40,16 +47,21 @@ impl Ring {
         let cap = next_pow2(capacity);
         Ring {
             inner: Arc::new(Inner {
-                buf: UnsafeCell::new(vec![0.0; cap]),
+                buf: (0..cap)
+                    .map(|_| UnsafeCell::new(0.0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
                 mask: cap - 1,
                 head: AtomicUsize::new(0),
                 tail: AtomicUsize::new(0),
+                endpoints: AtomicU8::new(0),
             }),
         }
     }
 
     /// Producer half (move this to the input callback).
     pub fn producer(&self) -> Prod {
+        self.claim(PRODUCER, "producer");
         Prod {
             inner: self.inner.clone(),
             scratch: 0,
@@ -58,9 +70,20 @@ impl Ring {
 
     /// Consumer half (move this to the output callback).
     pub fn consumer(&self) -> Cons {
+        self.claim(CONSUMER, "consumer");
         Cons {
             inner: self.inner.clone(),
         }
+    }
+
+    fn claim(&self, endpoint: u8, name: &str) {
+        let claimed =
+            self.inner
+                .endpoints
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state & (endpoint | RESETTING) == 0).then_some(state | endpoint)
+                });
+        assert!(claimed.is_ok(), "ring {name} already active");
     }
 
     pub fn capacity(&self) -> usize {
@@ -71,11 +94,20 @@ impl Ring {
     /// streams are torn down for a device change, when cpal has already guaranteed
     /// both callbacks have returned.
     pub fn reset(&self) {
+        assert!(
+            self.inner
+                .endpoints
+                .compare_exchange(0, RESETTING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "cannot reset a ring with active endpoints"
+        );
         self.inner.head.store(0, Ordering::Relaxed);
         self.inner.tail.store(0, Ordering::Relaxed);
-        for s in unsafe { &mut *self.inner.buf.get() }.iter_mut() {
-            *s = 0.0;
+        for slot in self.inner.buf.iter() {
+            // SAFETY: RESETTING excludes both endpoint issuance and active callbacks.
+            unsafe { *slot.get() = 0.0 };
         }
+        self.inner.endpoints.store(0, Ordering::Release);
     }
 }
 
@@ -87,6 +119,12 @@ pub struct Prod {
 
 unsafe impl Send for Prod {}
 
+impl Drop for Prod {
+    fn drop(&mut self) {
+        self.inner.endpoints.fetch_and(!PRODUCER, Ordering::Release);
+    }
+}
+
 impl Prod {
     /// Append as much of `data` as fits; returns how many frames were written.
     /// Dropping the remainder is the intended overflow behaviour (never block).
@@ -95,20 +133,19 @@ impl Prod {
         let head = inner.head.load(Ordering::Relaxed);
         let tail = inner.tail.load(Ordering::Acquire);
         let cap = inner.mask + 1;
-        let free = cap - (head - tail);
+        let free = cap - head.wrapping_sub(tail);
         let n = free.min(data.len());
+        self.scratch = self.scratch.saturating_add(data.len() - n);
         if n == 0 {
             return 0;
         }
-        let buf = unsafe { &mut *inner.buf.get() };
-        let first = (head & inner.mask).min(cap);
-        let head_len = n.min(cap - first);
-        buf[first..first + head_len].copy_from_slice(&data[..head_len]);
-        if n > head_len {
-            buf[..n - head_len].copy_from_slice(&data[head_len..n]);
+        let first = head & inner.mask;
+        for (offset, sample) in data[..n].iter().enumerate() {
+            // SAFETY: the single producer owns every free slot until the Release-store of
+            // head publishes it; the consumer cannot read this slot before that store.
+            unsafe { *inner.buf[(first + offset) & inner.mask].get() = *sample };
         }
         inner.head.store(head.wrapping_add(n), Ordering::Release);
-        self.scratch = self.scratch.saturating_add(data.len() - n);
         n
     }
 
@@ -125,24 +162,28 @@ pub struct Cons {
 
 unsafe impl Send for Cons {}
 
+impl Drop for Cons {
+    fn drop(&mut self) {
+        self.inner.endpoints.fetch_and(!CONSUMER, Ordering::Release);
+    }
+}
+
 impl Cons {
     /// Read up to `dst.len()` frames; returns how many were read (0 = starved).
     pub fn pop(&mut self, dst: &mut [f32]) -> usize {
         let inner = &*self.inner;
         let tail = inner.tail.load(Ordering::Relaxed);
         let head = inner.head.load(Ordering::Acquire);
-        let cap = inner.mask + 1;
         let avail = head.wrapping_sub(tail);
         let n = avail.min(dst.len());
         if n == 0 {
             return 0;
         }
-        let buf = unsafe { &*inner.buf.get() };
         let first = tail & inner.mask;
-        let head_len = n.min(cap - first);
-        dst[..head_len].copy_from_slice(&buf[first..first + head_len]);
-        if n > head_len {
-            dst[head_len..n].copy_from_slice(&buf[..n - head_len]);
+        for (offset, sample) in dst[..n].iter_mut().enumerate() {
+            // SAFETY: the Acquire-load of head only exposes fully written slots, and the
+            // single producer cannot reuse this slot until tail is Release-stored below.
+            *sample = unsafe { *inner.buf[(first + offset) & inner.mask].get() };
         }
         inner.tail.store(tail.wrapping_add(n), Ordering::Release);
         n
@@ -160,6 +201,24 @@ impl Cons {
 mod tests {
     use super::*;
     use crate::dsp::analysis::mean;
+
+    #[test]
+    fn cursor_overflow_preserves_capacity_and_fifo() {
+        let ring = Ring::new(8);
+        ring.inner.head.store(usize::MAX - 3, Ordering::Relaxed);
+        ring.inner.tail.store(usize::MAX - 3, Ordering::Relaxed);
+        let mut producer = ring.producer();
+        let mut consumer = ring.consumer();
+        assert_eq!(producer.push(&[1.0; 6]), 6);
+        assert_eq!(consumer.level(), 6);
+        assert_eq!(producer.push(&[2.0; 3]), 2);
+        assert_eq!(producer.dropped(), 1);
+        let mut out = [0.0; 8];
+        assert_eq!(consumer.pop(&mut out), 8);
+        assert_eq!(out, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(consumer.level(), 0);
+        assert_eq!(producer.push(&[3.0; 8]), 8);
+    }
 
     #[test]
     fn fifo_order_and_content_survive_wrapping() {
@@ -200,9 +259,8 @@ mod tests {
         let mut p = r.producer();
         assert_eq!(p.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 4);
         assert_eq!(p.push(&[7.0]), 0, "ring is full");
-        // Six offered to a 4-slot ring drops the two that did not fit. The contract is
-        // that it drops and returns, never that it keeps everything.
-        assert_eq!(p.dropped(), 2);
+        // Six offered to a 4-slot ring drops two, then the fully rejected push drops one.
+        assert_eq!(p.dropped(), 3);
         let mut c = r.consumer();
         assert_eq!(c.level(), 4);
         let mut dst = [0.0f32; 4];
@@ -221,6 +279,32 @@ mod tests {
         assert_eq!(c.pop(&mut []), 0);
         assert_eq!(c.level(), 0);
         assert_eq!(mean(&[]), 0.0);
+    }
+
+    #[test]
+    fn duplicate_endpoints_are_rejected_and_reissued_after_drop() {
+        let r = Ring::new(4);
+        let p = r.producer();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.producer())).is_err());
+        drop(p);
+        let _replacement = r.producer();
+
+        let c = r.consumer();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.consumer())).is_err());
+        drop(c);
+        let _replacement = r.consumer();
+    }
+
+    #[test]
+    fn reset_requires_idle_endpoints_and_clears_buffer() {
+        let r = Ring::new(4);
+        let mut p = r.producer();
+        assert_eq!(p.push(&[1.0, 2.0]), 2);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.reset())).is_err());
+        drop(p);
+        r.reset();
+        let c = r.consumer();
+        assert_eq!(c.level(), 0);
     }
 
     #[test]
